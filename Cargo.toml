@@ -1,0 +1,23 @@
+[package]
+name = "gomoku"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gomoku"
+path = "src/main.rs"
+
+[dependencies]
+macroquad = "=0.4.13"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
