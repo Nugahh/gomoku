@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod board;
 mod patterns;
 
 fn main() {
