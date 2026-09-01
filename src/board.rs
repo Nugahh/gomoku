@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use crate::patterns::{PatternTable, POW3};
+
 pub const SIZE: usize = 19;
 pub const PAD: usize = 4;
 pub const STRIDE: usize = SIZE + 2 * PAD; // 27
@@ -38,6 +40,20 @@ pub const fn to_xy(i: Idx) -> (usize, usize) {
 /// walked in both the `+d` and `-d` direction to cover all 8 directions.
 pub const DIRS: [i16; 4] = [1, STRIDE as i16, STRIDE as i16 + 1, STRIDE as i16 - 1];
 
+/// Vulnerability penalty per pair (spec §8.3): a pair of same-color stones
+/// where one flank is an opponent stone and the other is empty is one move
+/// away from being captured.
+const VULN_PENALTY: i32 = -1_200;
+
+pub struct Undo {
+    pub mv: Idx,
+    pub captured: [Idx; 16], // 4 axes x 2 signs x 2 stones per capture, max
+    pub n_captured: u8,
+    pub prev_zobrist: u64,
+    pub prev_acc: [i32; 2],
+    pub prev_captures: [u8; 2],
+}
+
 impl Player {
     #[inline]
     pub fn other(self) -> Player {
@@ -72,6 +88,7 @@ impl Xorshift64 {
     }
 }
 
+#[derive(Clone)]
 pub struct Board {
     cells: [Cell; TOTAL],
     /// Number of *stones* captured by each player, indexed by
@@ -182,6 +199,207 @@ impl Board {
             }
         }
         (out, n)
+    }
+
+    /// Safe accessor for offsets that may reach beyond the physical buffer
+    /// (see this task's implementation note on reach). Anything outside the
+    /// array is `Wall` — semantically correct, since nothing real is ever
+    /// there.
+    #[inline]
+    fn cell_at(&self, center: Idx, offset: i32) -> Cell {
+        let i = center as i32 + offset;
+        if i < 0 || i as usize >= TOTAL {
+            return Cell::Wall;
+        }
+        self.cells.get(i as usize).copied().unwrap_or(Cell::Wall)
+    }
+
+    /// Encodes the 9-cell window centered at `c` along axis `d`, relative
+    /// to `p` (own stone = 1, empty = 0, opponent-or-wall = 2), matching
+    /// `patterns::PatternTable`'s encoding (spec §5.1).
+    fn window_code(&self, c: Idx, d: i16, p: Player) -> u32 {
+        let mut code = 0u32;
+        for (slot, k) in (-4..=4i32).enumerate() {
+            let cell = self.cell_at(c, k * d as i32);
+            let trit: u32 = if cell == Cell::Empty {
+                0
+            } else if cell == p.cell() {
+                1
+            } else {
+                2
+            };
+            code += trit * POW3.get(slot).copied().unwrap_or(0);
+        }
+        code
+    }
+
+    #[inline]
+    fn stone_window_score(&self, c: Idx, d: i16, owner: Player, pt: &PatternTable) -> i32 {
+        pt.get(self.window_code(c, d, owner)).score
+    }
+
+    /// Vulnerability contribution of the pair `(c, c+d)`, anchored at `c`
+    /// so each pair is scored exactly once (spec §8.3).
+    fn pair_vuln_score(&self, c: Idx, d: i16, owner: Player) -> i32 {
+        let opp = owner.other().cell();
+        if self.cell_at(c, d as i32) != owner.cell() {
+            return 0;
+        }
+        let before = self.cell_at(c, -(d as i32));
+        let after = self.cell_at(c, 2 * d as i32);
+        let vulnerable =
+            (before == opp && after == Cell::Empty) || (before == Cell::Empty && after == opp);
+        if vulnerable {
+            VULN_PENALTY
+        } else {
+            0
+        }
+    }
+
+    /// Adds `sign * score` to the accumulator entry of every stone whose
+    /// pattern-table window could be affected by a change at `center`
+    /// (spec §6.4 step 2/5, §8.2). Call with `sign = -1` before mutating
+    /// the board, `sign = 1` after.
+    fn adjust_axis_neighbors(&mut self, center: Idx, pt: &PatternTable, sign: i32) {
+        for &d in DIRS.iter() {
+            for k in (-4..=4i32).filter(|&k| k != 0) {
+                let cell = self.cell_at(center, k * d as i32);
+                let owner = match cell {
+                    Cell::Black => Player::Black,
+                    Cell::White => Player::White,
+                    _ => continue,
+                };
+                let c_off = center as i32 + k * d as i32;
+                if c_off < 0 || c_off as usize >= TOTAL {
+                    continue;
+                }
+                let c = c_off as Idx;
+                let score = self.stone_window_score(c, d, owner, pt);
+                self.acc[owner as usize] += sign * score;
+            }
+        }
+    }
+
+    /// Same shape as `adjust_axis_neighbors`, at the smaller radius the
+    /// vulnerability term needs (see this task's implementation note).
+    fn adjust_axis_vuln(&mut self, center: Idx, sign: i32) {
+        for &d in DIRS.iter() {
+            for k in -2..=1i32 {
+                let c_off = center as i32 + k * d as i32;
+                if c_off < 0 || c_off as usize >= TOTAL {
+                    continue;
+                }
+                let c = c_off as Idx;
+                let owner = match self.get(c) {
+                    Cell::Black => Player::Black,
+                    Cell::White => Player::White,
+                    _ => continue,
+                };
+                let score = self.pair_vuln_score(c, d, owner);
+                self.acc[owner as usize] += sign * score;
+            }
+        }
+    }
+
+    /// Updates the radius-2 neighbor-count grid used by `rules::generate`
+    /// (spec §7.4) around `center` by `delta`, saturating rather than
+    /// over/underflowing.
+    fn adjust_neighbor_grid(&mut self, center: Idx, delta: i32) {
+        let stride = STRIDE as i32;
+        for dy in -2..=2i32 {
+            for dx in -2..=2i32 {
+                let i = center as i32 + dy * stride + dx;
+                if i < 0 || i as usize >= TOTAL {
+                    continue;
+                }
+                if let Some(slot) = self.neighbor.get_mut(i as usize) {
+                    *slot = (*slot as i32 + delta).clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+
+    /// Applies `mv` for `self.to_move`. Assumes `mv` is legal — callers
+    /// must check `rules::is_legal` first (spec §6.4).
+    pub fn play(&mut self, mv: Idx, pt: &PatternTable) -> Undo {
+        let p = self.to_move;
+        let mut undo = Undo {
+            mv,
+            captured: [0; 16],
+            n_captured: 0,
+            prev_zobrist: self.zobrist,
+            prev_acc: self.acc,
+            prev_captures: self.captures,
+        };
+
+        self.adjust_axis_neighbors(mv, pt, -1);
+        self.adjust_axis_vuln(mv, -1);
+
+        self.set_raw(mv, p.cell());
+        self.zobrist ^= self.key_cell[p as usize][mv as usize];
+        self.stone_count += 1;
+        self.adjust_neighbor_grid(mv, 1);
+
+        let (captured, n) = self.captures_of(mv, p);
+        let owner = p.other();
+        for cc in captured.iter().take(n) {
+            self.adjust_axis_neighbors(*cc, pt, -1);
+            self.adjust_axis_vuln(*cc, -1);
+            for &d in DIRS.iter() {
+                self.acc[owner as usize] -= self.stone_window_score(*cc, d, owner, pt);
+            }
+            self.set_raw(*cc, Cell::Empty);
+            self.zobrist ^= self.key_cell[owner as usize][*cc as usize];
+            self.adjust_neighbor_grid(*cc, -1);
+            self.stone_count -= 1;
+        }
+        undo.captured = captured;
+        undo.n_captured = n as u8;
+
+        self.adjust_axis_neighbors(mv, pt, 1);
+        self.adjust_axis_vuln(mv, 1);
+        for cc in captured.iter().take(n) {
+            self.adjust_axis_neighbors(*cc, pt, 1);
+            self.adjust_axis_vuln(*cc, 1);
+        }
+        for &d in DIRS.iter() {
+            self.acc[p as usize] += self.stone_window_score(mv, d, p, pt);
+        }
+
+        let old_idx = self.captures[p as usize].min(10) as usize;
+        self.zobrist ^= self.key_captures[p as usize].get(old_idx).copied().unwrap_or(0);
+        self.captures[p as usize] = self.captures[p as usize].saturating_add(n as u8);
+        let new_idx = self.captures[p as usize].min(10) as usize;
+        self.zobrist ^= self.key_captures[p as usize].get(new_idx).copied().unwrap_or(0);
+
+        self.to_move = owner;
+        self.zobrist ^= self.key_side;
+
+        undo
+    }
+
+    /// Exactly reverses a `play`. Restores cells, neighbor grid and
+    /// stone_count by replaying the recorded change; restores zobrist, acc
+    /// and captures by direct snapshot rather than recomputing them (spec
+    /// §6.4) — the incremental math above is complex enough that re-running
+    /// it backwards would just be a second place to get it wrong.
+    pub fn undo(&mut self, u: &Undo) {
+        let mover = self.to_move.other();
+        let captured_owner = mover.other();
+
+        for cc in u.captured.iter().take(u.n_captured as usize) {
+            self.set_raw(*cc, captured_owner.cell());
+            self.adjust_neighbor_grid(*cc, 1);
+            self.stone_count += 1;
+        }
+        self.set_raw(u.mv, Cell::Empty);
+        self.adjust_neighbor_grid(u.mv, -1);
+        self.stone_count -= 1;
+
+        self.zobrist = u.prev_zobrist;
+        self.acc = u.prev_acc;
+        self.captures = u.prev_captures;
+        self.to_move = mover;
     }
 }
 
@@ -320,5 +538,76 @@ mod tests {
         let b = Board::new();
         let (_captured, n) = b.captures_of(idx(0, 0), Player::White);
         assert_eq!(n, 0);
+    }
+
+    fn random_empty_cell(b: &Board, rng: &mut Xorshift64) -> Option<Idx> {
+        let mut empties = Vec::new();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let i = idx(x, y);
+                if b.get(i) == Cell::Empty {
+                    empties.push(i);
+                }
+            }
+        }
+        if empties.is_empty() {
+            return None;
+        }
+        let pick = (rng.next() as usize) % empties.len();
+        empties.get(pick).copied()
+    }
+
+    #[test]
+    fn play_undo_round_trip_restores_exact_state() {
+        // Uses "any empty cell" rather than full rule legality: play/undo's
+        // bookkeeping (accumulator, zobrist, neighbor grid, captures) does
+        // not care about double-three, which is a search/UI-level filter,
+        // not a board-mechanics concern. This keeps board.rs's own test
+        // independent of rules.rs, which does not exist yet.
+        let pt = PatternTable::build();
+        for seed in 0..1000u64 {
+            let mut rng = Xorshift64(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
+            let mut b = Board::new();
+            let snapshot = b.clone();
+            let mut undos = Vec::new();
+            for _ in 0..50 {
+                let Some(mv) = random_empty_cell(&b, &mut rng) else {
+                    break;
+                };
+                undos.push(b.play(mv, &pt));
+            }
+            for u in undos.iter().rev() {
+                b.undo(u);
+            }
+            assert_eq!(b.cells, snapshot.cells, "seed {seed}: cells differ after undo");
+            assert_eq!(b.captures, snapshot.captures, "seed {seed}: captures differ");
+            assert_eq!(b.to_move, snapshot.to_move, "seed {seed}: to_move differs");
+            assert_eq!(b.zobrist, snapshot.zobrist, "seed {seed}: zobrist differs");
+            assert_eq!(b.stone_count, snapshot.stone_count, "seed {seed}: stone_count differs");
+            assert_eq!(b.neighbor, snapshot.neighbor, "seed {seed}: neighbor grid differs");
+            assert_eq!(b.acc, snapshot.acc, "seed {seed}: accumulator differs");
+        }
+    }
+
+    #[test]
+    fn play_capture_updates_captures_and_frees_cells() {
+        let pt = PatternTable::build();
+        let mut b = Board::new();
+        // White _ Black Black _  ->  White plays at (3,0), captures the pair.
+        b.set_raw(idx(0, 0), Cell::White);
+        b.to_move = Player::Black;
+        b.play(idx(1, 0), &pt); // Black
+        b.to_move = Player::White;
+        // set up manually instead of alternating turns, to isolate the capture:
+        b.set_raw(idx(2, 0), Cell::Black);
+        let before_black_stone_count = b.stone_count;
+        b.to_move = Player::White;
+        b.play(idx(3, 0), &pt);
+        assert_eq!(b.get(idx(1, 0)), Cell::Empty, "captured stone not removed");
+        assert_eq!(b.get(idx(2, 0)), Cell::Empty, "captured stone not removed");
+        assert_eq!(b.captures[Player::White as usize], 2);
+        // before_black_stone_count reflects the 1 Black stone placed via
+        // `play` so far; White's move adds 1, the captured pair removes 2.
+        assert_eq!(b.stone_count, before_black_stone_count + 1 - 2);
     }
 }
