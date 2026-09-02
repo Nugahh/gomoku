@@ -309,7 +309,7 @@ fn negamax(b: &mut Board, ctx: &mut SearchCtx, depth: u8, alpha: i32, beta: i32,
                 }
             }
             if let Some(slot) = ctx.history.get_mut(mv as usize) {
-                *slot += (depth as i32) * (depth as i32);
+                *slot = slot.saturating_add((depth as i32) * (depth as i32));
             }
             break;
         }
