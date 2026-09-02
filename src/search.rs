@@ -270,7 +270,7 @@ fn negamax(
     extensions_used: u8,
 ) -> i32 {
     ctx.nodes += 1;
-    if ctx.nodes % 2048 == 0 && Instant::now() >= ctx.deadline {
+    if ctx.nodes % 512 == 0 && Instant::now() >= ctx.deadline {
         ctx.aborted = true;
     }
     if ctx.aborted {
@@ -805,15 +805,8 @@ mod tests {
         b.to_move = Player::Black;
         let cfg = SearchConfig { max_depth: 12, time_budget_ms: 200, max_candidates: 20 };
         let (_mv, stats) = find_best_move(&mut b, &cfg, &pt, &mut tt);
-        // Tolerance widened from Task 11's 600ms (spec-unrelated build detail:
-        // debug/test builds are unoptimized, and the deadline check only runs
-        // every 2048 nodes, so worst-case overrun scales with per-node cost;
-        // Task 12's threat extension makes individual iterations deeper
-        // before that check point, which is fine under the real release
-        // build — release-mode timing for this exact scenario measures
-        // ~260ms, comfortably inside budget).
         assert!(
-            stats.elapsed < Duration::from_millis(2_000),
+            stats.elapsed < Duration::from_millis(600),
             "search overran its 200ms budget by too much: {:?}",
             stats.elapsed
         );
