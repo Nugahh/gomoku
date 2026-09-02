@@ -6,6 +6,19 @@ use crate::patterns::PatternTable;
 use crate::rules::{self, GameEnd};
 use std::time::{Duration, Instant};
 
+use crate::board::{Cell, DIRS, TOTAL};
+use crate::patterns::{F_FIVE, F_OPEN_FOUR};
+
+const ORD_TT: i32 = 1_000_000;
+const ORD_FIVE: i32 = 900_000;
+const ORD_BLOCK: i32 = 800_000;
+const ORD_OPEN_FOUR: i32 = 700_000;
+const ORD_CAPTURE_BASE: i32 = 500_000;
+const ORD_KILLER1: i32 = 400_000;
+const ORD_KILLER2: i32 = 390_000;
+const ORD_HISTORY_CAP: i32 = 300_000;
+const MAX_PLY: usize = 64;
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum Bound {
     #[default]
@@ -118,6 +131,92 @@ struct SearchCtx<'a> {
     nodes: u64,
     deadline: Instant,
     aborted: bool,
+    killers: [[Idx; 2]; MAX_PLY],
+    history: [i32; TOTAL],
+    tt_hits: u64,
+    tt_probes: u64,
+}
+
+impl<'a> SearchCtx<'a> {
+    fn new(pt: &'a PatternTable, tt: &'a mut TranspositionTable, cfg: &'a SearchConfig, deadline: Instant) -> Self {
+        SearchCtx {
+            pt,
+            tt,
+            cfg,
+            nodes: 0,
+            deadline,
+            aborted: false,
+            killers: [[Idx::MAX; 2]; MAX_PLY],
+            history: [0; TOTAL],
+            tt_hits: 0,
+            tt_probes: 0,
+        }
+    }
+}
+
+/// Scores a candidate move for ordering (spec §9.3). Priorities 1-6 are
+/// hard overrides (each returns immediately); priorities 7-8 (history and
+/// static positional gain) are combined as the score for ordinary quiet
+/// moves, since both are small relative to the overrides and either alone
+/// is a weak signal.
+#[allow(clippy::too_many_arguments)]
+fn order_score(
+    b: &Board,
+    pt: &PatternTable,
+    mv: Idx,
+    me: Player,
+    opp: Player,
+    tt_mv: Option<Idx>,
+    killers: (Idx, Idx),
+    history: &[i32],
+) -> i32 {
+    if Some(mv) == tt_mv {
+        return ORD_TT;
+    }
+
+    let mut me_five = false;
+    let mut me_open_four = false;
+    let mut opp_threat = false;
+    let mut me_static_gain = 0i32;
+    for &d in DIRS.iter() {
+        let pat_me = pt.get(b.hypothetical_window_code(mv, d, me));
+        if pat_me.flags & F_FIVE != 0 {
+            me_five = true;
+        }
+        if pat_me.flags & F_OPEN_FOUR != 0 {
+            me_open_four = true;
+        }
+        me_static_gain += pat_me.score;
+
+        let pat_opp = pt.get(b.hypothetical_window_code(mv, d, opp));
+        if pat_opp.flags & (F_FIVE | F_OPEN_FOUR) != 0 {
+            opp_threat = true;
+        }
+    }
+
+    if me_five {
+        return ORD_FIVE;
+    }
+    if opp_threat {
+        return ORD_BLOCK;
+    }
+    if me_open_four {
+        return ORD_OPEN_FOUR;
+    }
+
+    let (_captured, n) = b.captures_of(mv, me);
+    if n > 0 {
+        return ORD_CAPTURE_BASE + 1_000 * (n as i32 / 2);
+    }
+    if mv == killers.0 {
+        return ORD_KILLER1;
+    }
+    if mv == killers.1 {
+        return ORD_KILLER2;
+    }
+
+    let hist = history.get(mv as usize).copied().unwrap_or(0).min(ORD_HISTORY_CAP);
+    hist + me_static_gain
 }
 
 /// Negamax with fail-soft alpha-beta (spec §9.2). Returns a score from the
@@ -139,15 +238,50 @@ fn negamax(b: &mut Board, ctx: &mut SearchCtx, depth: u8, alpha: i32, beta: i32,
         return eval::evaluate(b);
     }
 
+    let orig_alpha = alpha;
+    let mut alpha = alpha;
+
+    ctx.tt_probes += 1;
+    let mut tt_move = None;
+    if let Some(e) = ctx.tt.probe(b.zobrist) {
+        ctx.tt_hits += 1;
+        tt_move = Some(e.mv);
+        if e.depth >= depth {
+            match e.bound {
+                Bound::Exact => return e.score,
+                Bound::Lower if e.score >= beta => return e.score,
+                Bound::Upper if e.score <= alpha => return e.score,
+                _ => {}
+            }
+        }
+    }
+
     let mut candidates = Vec::new();
     rules::generate(b, b.to_move, ctx.pt, &mut candidates);
     if candidates.is_empty() {
         return 0; // no legal moves; defensive fallback, see Task 9 notes
     }
 
+    let me = b.to_move;
+    let opp = me.other();
+    let killers_here = ctx
+        .killers
+        .get(ply as usize)
+        .map(|k| (k[0], k[1]))
+        .unwrap_or((Idx::MAX, Idx::MAX));
+    let mut scored: Vec<(i32, Idx)> = candidates
+        .iter()
+        .map(|&mv| {
+            let s = order_score(b, ctx.pt, mv, me, opp, tt_move, killers_here, &ctx.history);
+            (s, mv)
+        })
+        .collect();
+    scored.sort_unstable_by(|a, bnd| bnd.0.cmp(&a.0));
+    scored.truncate(ctx.cfg.max_candidates);
+
     let mut best = i32::MIN + 1;
-    let mut alpha = alpha;
-    for &mv in &candidates {
+    let mut best_move = None;
+    for &(_, mv) in &scored {
         let u = b.play(mv, ctx.pt);
         let end = rules::check_end(b, mv, ctx.pt);
         let score = match end {
@@ -162,14 +296,39 @@ fn negamax(b: &mut Board, ctx: &mut SearchCtx, depth: u8, alpha: i32, beta: i32,
         }
         if score > best {
             best = score;
+            best_move = Some(mv);
         }
         if best > alpha {
             alpha = best;
         }
         if alpha >= beta {
+            if let Some(k) = ctx.killers.get_mut(ply as usize) {
+                if k[0] != mv {
+                    k[1] = k[0];
+                    k[0] = mv;
+                }
+            }
+            if let Some(slot) = ctx.history.get_mut(mv as usize) {
+                *slot += (depth as i32) * (depth as i32);
+            }
             break;
         }
     }
+
+    if let Some(bm) = best_move {
+        let bound = if best <= orig_alpha {
+            Bound::Upper
+        } else if best >= beta {
+            Bound::Lower
+        } else {
+            Bound::Exact
+        };
+        ctx.tt.store(
+            b.zobrist,
+            TtEntry { key: b.zobrist, score: best, mv: bm, depth, bound },
+        );
+    }
+
     best
 }
 
@@ -223,17 +382,46 @@ mod tests {
         }
         b.to_move = Player::Black;
         let cfg = SearchConfig::default();
-        let mut ctx = SearchCtx {
-            pt: &pt,
-            tt: &mut tt,
-            cfg: &cfg,
-            nodes: 0,
-            deadline: far_deadline(),
-            aborted: false,
-        };
+        let mut ctx = SearchCtx::new(&pt, &mut tt, &cfg, far_deadline());
         // At depth 1, playing (8,5) wins immediately; negamax should return
         // a score very close to WIN (within a few ply of it).
         let score = negamax(&mut b, &mut ctx, 1, -WIN, WIN, 0);
         assert!(score > WIN - 10, "expected a near-WIN score, got {score}");
+    }
+
+    #[test]
+    fn order_score_ranks_five_above_quiet_move() {
+        let pt = PatternTable::build();
+        let mut b = Board::new();
+        for x in 4..8 {
+            b.to_move = Player::Black;
+            b.play(idx(x, 5), &pt);
+        }
+        let history = [0i32; crate::board::TOTAL];
+        let no_killers = (Idx::MAX, Idx::MAX);
+        let winning_score = order_score(
+            &b, &pt, idx(8, 5), Player::Black, Player::White, None, no_killers, &history,
+        );
+        let quiet_score = order_score(
+            &b, &pt, idx(15, 15), Player::Black, Player::White, None, no_killers, &history,
+        );
+        assert_eq!(winning_score, ORD_FIVE);
+        assert!(winning_score > quiet_score);
+    }
+
+    #[test]
+    fn order_score_ranks_tt_move_above_everything() {
+        let pt = PatternTable::build();
+        let mut b = Board::new();
+        for x in 4..8 {
+            b.to_move = Player::Black;
+            b.play(idx(x, 5), &pt);
+        }
+        let history = [0i32; crate::board::TOTAL];
+        let tt_move_score = order_score(
+            &b, &pt, idx(15, 15), Player::Black, Player::White,
+            Some(idx(15, 15)), (Idx::MAX, Idx::MAX), &history,
+        );
+        assert_eq!(tt_move_score, ORD_TT);
     }
 }

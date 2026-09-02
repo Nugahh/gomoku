@@ -233,6 +233,31 @@ impl Board {
         code
     }
 
+    /// Like `window_code`, but treats the center (`c`) as if it already
+    /// held `p`'s stone, regardless of what's actually there. Used only
+    /// for move ordering, where `c` is always an empty candidate cell and
+    /// mutating the board via `play`/`undo` to test each one would be far
+    /// too slow to run on 40-80 candidates at every search node.
+    pub fn hypothetical_window_code(&self, c: Idx, d: i16, p: Player) -> u32 {
+        let mut code = 0u32;
+        for (slot, k) in (-4..=4i32).enumerate() {
+            let trit: u32 = if k == 0 {
+                1
+            } else {
+                let cell = self.cell_at(c, k * d as i32);
+                if cell == Cell::Empty {
+                    0
+                } else if cell == p.cell() {
+                    1
+                } else {
+                    2
+                }
+            };
+            code += trit * POW3.get(slot).copied().unwrap_or(0);
+        }
+        code
+    }
+
     /// True if any stone is within Chebyshev radius 2 of `i` (spec §7.4).
     #[inline]
     pub fn has_neighbor(&self, i: Idx) -> bool {
