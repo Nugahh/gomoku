@@ -233,6 +233,20 @@ impl Board {
         code
     }
 
+    /// True if any stone is within Chebyshev radius 2 of `i` (spec §7.4).
+    #[inline]
+    pub fn has_neighbor(&self, i: Idx) -> bool {
+        self.neighbor.get(i as usize).copied().unwrap_or(0) > 0
+    }
+
+    /// Public wrapper around the window encoding used internally by
+    /// `play`/`undo` (Task 5). Exposed so `rules.rs` can query pattern
+    /// flags (e.g. free-three) without re-deriving the encoding.
+    #[inline]
+    pub fn window_code_pub(&self, c: Idx, d: i16, p: Player) -> u32 {
+        self.window_code(c, d, p)
+    }
+
     #[inline]
     fn stone_window_score(&self, c: Idx, d: i16, owner: Player, pt: &PatternTable) -> i32 {
         pt.get(self.window_code(c, d, owner)).score
