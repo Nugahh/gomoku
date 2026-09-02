@@ -332,10 +332,202 @@ fn negamax(b: &mut Board, ctx: &mut SearchCtx, depth: u8, alpha: i32, beta: i32,
     best
 }
 
+/// Runs one full iterative-deepening iteration at a fixed `depth`, inside
+/// the aspiration window `[window_lo, window_hi]`. Returns `None` only if
+/// the search was aborted by the clock mid-iteration — in that case the
+/// caller must discard everything from this call and keep the previous
+/// depth's result (spec §9.7). The final `bool` is whether the result fell
+/// outside the aspiration window and needs a full-window re-search (spec
+/// §9.2).
+fn root_search(
+    b: &mut Board,
+    ctx: &mut SearchCtx,
+    depth: u8,
+    window_lo: i32,
+    window_hi: i32,
+) -> Option<(Idx, i32, Vec<(Idx, i32)>, bool)> {
+    let mut candidates = Vec::new();
+    rules::generate(b, b.to_move, ctx.pt, &mut candidates);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let me = b.to_move;
+    let opp = me.other();
+    let tt_move = ctx.tt.probe(b.zobrist).map(|e| e.mv);
+    let mut scored: Vec<(i32, Idx)> = candidates
+        .iter()
+        .map(|&mv| {
+            let s = order_score(b, ctx.pt, mv, me, opp, tt_move, (Idx::MAX, Idx::MAX), &ctx.history);
+            (s, mv)
+        })
+        .collect();
+    scored.sort_unstable_by(|a, bb| bb.0.cmp(&a.0));
+    scored.truncate(ctx.cfg.max_candidates);
+
+    let Some(&(_, mut best_move)) = scored.first() else {
+        return None;
+    };
+    let mut alpha = window_lo;
+    let mut best = i32::MIN + 1;
+    let mut root_scores = Vec::new();
+
+    for (i, &(_, mv)) in scored.iter().enumerate() {
+        let u = b.play(mv, ctx.pt);
+        let end = rules::check_end(b, mv, ctx.pt);
+        let score = match end {
+            GameEnd::Win(_) => WIN - 1,
+            GameEnd::Draw => 0,
+            GameEnd::None if i == 0 => -negamax(b, ctx, depth - 1, -window_hi, -alpha, 1),
+            GameEnd::None => {
+                // PVS (spec §9.2): null-window probe first; re-search with
+                // the full window only if it beats alpha.
+                let null_score = -negamax(b, ctx, depth - 1, -alpha - 1, -alpha, 1);
+                if null_score > alpha && null_score < window_hi {
+                    -negamax(b, ctx, depth - 1, -window_hi, -alpha, 1)
+                } else {
+                    null_score
+                }
+            }
+        };
+        b.undo(&u);
+
+        if ctx.aborted {
+            return None;
+        }
+        root_scores.push((mv, score));
+        if score > best {
+            best = score;
+            best_move = mv;
+        }
+        if best > alpha {
+            alpha = best;
+        }
+        if alpha >= window_hi {
+            break;
+        }
+    }
+
+    let failed = best <= window_lo || best >= window_hi;
+    Some((best_move, best, root_scores, failed))
+}
+
+/// Walks the transposition table forward from the current position,
+/// playing each node's best-known move, to reconstruct the principal
+/// variation for the debug panel (spec §9.1's `SearchStats::pv`, §10.4).
+/// Always undoes what it plays, leaving `b` unchanged.
+fn extract_pv(b: &mut Board, tt: &TranspositionTable, pt: &PatternTable, max_len: usize) -> Vec<Idx> {
+    let mut pv = Vec::new();
+    let mut undos = Vec::new();
+    for _ in 0..max_len {
+        let Some(e) = tt.probe(b.zobrist) else {
+            break;
+        };
+        if b.get(e.mv) != Cell::Empty {
+            break;
+        }
+        pv.push(e.mv);
+        undos.push(b.play(e.mv, pt));
+    }
+    for u in undos.iter().rev() {
+        b.undo(u);
+    }
+    pv
+}
+
+/// The module's public entry point (spec §9.1). Deepens iteratively from
+/// depth 1 to `cfg.max_depth`, stopping when `cfg.time_budget_ms` is spent;
+/// always returns the best move from the last *completed* depth, so an
+/// interrupted deeper iteration never corrupts the result (spec §9.2, §9.7).
+pub fn find_best_move(
+    b: &mut Board,
+    cfg: &SearchConfig,
+    pt: &PatternTable,
+    tt: &mut TranspositionTable,
+) -> (Idx, SearchStats) {
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(cfg.time_budget_ms);
+
+    let mut candidates = Vec::new();
+    rules::generate(b, b.to_move, pt, &mut candidates);
+    if candidates.is_empty() {
+        // Defensive only (R12): callers check `rules::check_end` before
+        // invoking search, so this position should never actually have no
+        // legal moves. `mv = 0` is a sentinel the caller must not play.
+        return (
+            0,
+            SearchStats {
+                depth_reached: 0,
+                nodes: 0,
+                elapsed: start.elapsed(),
+                pv: Vec::new(),
+                root_scores: Vec::new(),
+                tt_hits: 0,
+                tt_probes: 0,
+            },
+        );
+    }
+
+    let mut ctx = SearchCtx::new(pt, tt, cfg, deadline);
+    let mut best_move = candidates.first().copied().unwrap_or(0);
+    let mut last_score = 0i32;
+    let mut root_scores = Vec::new();
+    let mut depth_reached = 0u8;
+
+    for depth in 1..=cfg.max_depth {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let (window_lo, window_hi) = if depth > 3 {
+            (last_score - 50, last_score + 50)
+        } else {
+            (-WIN, WIN)
+        };
+
+        let Some((mv, score, scores, failed)) = root_search(b, &mut ctx, depth, window_lo, window_hi) else {
+            break;
+        };
+        let (mv, score, scores) = if failed {
+            match root_search(b, &mut ctx, depth, -WIN, WIN) {
+                Some((mv2, score2, scores2, _)) => (mv2, score2, scores2),
+                None => break,
+            }
+        } else {
+            (mv, score, scores)
+        };
+
+        best_move = mv;
+        last_score = score;
+        root_scores = scores;
+        depth_reached = depth;
+
+        // Immediate win shortcut (spec §9.5): a near-WIN score means a
+        // forced win was found; deepening further cannot improve on it.
+        if last_score >= WIN - 1000 {
+            break;
+        }
+    }
+
+    let pv = extract_pv(b, ctx.tt, pt, depth_reached.max(1) as usize);
+
+    (
+        best_move,
+        SearchStats {
+            depth_reached,
+            nodes: ctx.nodes,
+            elapsed: start.elapsed(),
+            pv,
+            root_scores,
+            tt_hits: ctx.tt_hits,
+            tt_probes: ctx.tt_probes,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::idx;
+    use crate::board::{idx, SIZE};
 
     fn far_deadline() -> Instant {
         Instant::now() + Duration::from_secs(30)
@@ -423,5 +615,58 @@ mod tests {
             Some(idx(15, 15)), (Idx::MAX, Idx::MAX), &history,
         );
         assert_eq!(tt_move_score, ORD_TT);
+    }
+
+    #[test]
+    fn find_best_move_on_empty_board_returns_center() {
+        let pt = PatternTable::build();
+        let mut tt = TranspositionTable::new();
+        let mut b = Board::new();
+        let cfg = SearchConfig { max_depth: 4, time_budget_ms: 400, max_candidates: 20 };
+        let (mv, stats) = find_best_move(&mut b, &cfg, &pt, &mut tt);
+        assert_eq!(mv, idx(SIZE / 2, SIZE / 2));
+        assert!(stats.depth_reached >= 1);
+    }
+
+    #[test]
+    fn find_best_move_takes_the_immediate_win() {
+        let pt = PatternTable::build();
+        let mut tt = TranspositionTable::new();
+        let mut b = Board::new();
+        for x in 4..8 {
+            b.to_move = Player::Black;
+            b.play(idx(x, 5), &pt);
+        }
+        b.to_move = Player::Black;
+        let cfg = SearchConfig { max_depth: 6, time_budget_ms: 400, max_candidates: 20 };
+        let (mv, stats) = find_best_move(&mut b, &cfg, &pt, &mut tt);
+        assert!(
+            mv == idx(8, 5) || mv == idx(3, 5),
+            "expected one of the two immediate-win completions, got {mv:?}"
+        );
+        assert!(stats.depth_reached >= 1);
+    }
+
+    #[test]
+    fn find_best_move_respects_time_budget() {
+        let pt = PatternTable::build();
+        let mut tt = TranspositionTable::new();
+        let mut b = Board::new();
+        // a handful of scattered stones so real search work happens
+        for &(x, y, p) in &[
+            (9, 9, Player::Black), (9, 10, Player::White), (10, 9, Player::Black),
+            (8, 8, Player::White), (11, 11, Player::Black), (7, 7, Player::White),
+        ] {
+            b.to_move = p;
+            b.play(idx(x, y), &pt);
+        }
+        b.to_move = Player::Black;
+        let cfg = SearchConfig { max_depth: 12, time_budget_ms: 200, max_candidates: 20 };
+        let (_mv, stats) = find_best_move(&mut b, &cfg, &pt, &mut tt);
+        assert!(
+            stats.elapsed < Duration::from_millis(600),
+            "search overran its 200ms budget by too much: {:?}",
+            stats.elapsed
+        );
     }
 }
