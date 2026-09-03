@@ -245,7 +245,7 @@ fn score_order_and_truncate(
     scored.sort_unstable_by(|a, bb| bb.0.cmp(&a.0));
 
     if scored.first().map(|&(s, _)| s >= ORD_BLOCK).unwrap_or(false) {
-        scored.retain(|&(s, _)| s >= ORD_BLOCK);
+        scored.retain(|&(s, mv)| s >= ORD_BLOCK || b.captures_of(mv, me).1 > 0);
     }
     scored.truncate(ctx.cfg.max_candidates);
     scored
