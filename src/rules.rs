@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::board::{idx, Board, Cell, Idx, Player, DIRS, SIZE, TOTAL};
+use crate::board::{idx, player_slot, Board, Cell, Idx, Player, DIRS, SIZE, TOTAL};
 use crate::patterns::{PatternTable, F_FREE_THREE, F_FIVE};
 
 /// Number of axes on which placing `p` at `mv` creates a free-three (spec
@@ -74,7 +74,7 @@ fn five_is_breakable(b: &Board, p: Player, alignment: &[Idx], pt: &PatternTable)
     let mut candidates = Vec::new();
     generate(b, opp, pt, &mut candidates);
 
-    let p_lost_stones = b.captures[opp as usize];
+    let p_lost_stones = player_slot(b.captures, opp);
     if p_lost_stones >= 8 {
         for &mv2 in &candidates {
             let (_c, n) = b.captures_of(mv2, opp);
@@ -86,7 +86,7 @@ fn five_is_breakable(b: &Board, p: Player, alignment: &[Idx], pt: &PatternTable)
 
     for &mv2 in &candidates {
         let (captured, n) = b.captures_of(mv2, opp);
-        if captured[..n].iter().any(|c| alignment.contains(c)) {
+        if captured.iter().take(n).any(|c| alignment.contains(c)) {
             return true;
         }
     }
@@ -102,7 +102,7 @@ fn five_is_breakable(b: &Board, p: Player, alignment: &[Idx], pt: &PatternTable)
 pub fn check_end(b: &mut Board, last: Idx, pt: &PatternTable) -> GameEnd {
     let p = b.to_move.other();
 
-    if b.captures[p as usize] >= 10 {
+    if player_slot(b.captures, p) >= 10 {
         return GameEnd::Win(p);
     }
 
@@ -151,6 +151,7 @@ pub fn generate(b: &Board, p: Player, pt: &PatternTable, out: &mut Vec<Idx>) {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

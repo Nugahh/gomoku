@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::board::{Board, Player};
+use crate::board::{player_slot, Board, Player};
 
 pub const WIN: i32 = 100_000_000;
 
@@ -19,9 +19,9 @@ pub const CAP_BONUS: [i32; 6] = [0, 4_000, 12_000, 30_000, 90_000, 10_000_000];
 pub fn evaluate(b: &Board) -> i32 {
     let me = b.to_move;
     let op = me.other();
-    let me_bonus = cap_bonus(b.captures[me as usize]);
-    let op_bonus = cap_bonus(b.captures[op as usize]);
-    (b.acc[me as usize] + me_bonus) - (b.acc[op as usize] + op_bonus)
+    let me_bonus = cap_bonus(player_slot(b.captures, me));
+    let op_bonus = cap_bonus(player_slot(b.captures, op));
+    (player_slot(b.acc, me) + me_bonus) - (player_slot(b.acc, op) + op_bonus)
 }
 
 #[inline]
@@ -33,6 +33,7 @@ fn cap_bonus(stones_captured: u8) -> i32 {
         .unwrap_or_else(|| CAP_BONUS.iter().copied().last().unwrap_or(0))
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

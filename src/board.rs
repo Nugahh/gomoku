@@ -72,6 +72,30 @@ impl Player {
     }
 }
 
+/// Indexes a `[T; 2]` array by `Player` without spreading a raw `[]`
+/// through the accumulator's hot path (Tasks 5/7/8). `p as usize` can only
+/// ever be 0 or 1 — the 2-variant enum makes it provably safe in a way
+/// `clippy::indexing_slicing` can't see — so the raw index is confined to
+/// these two functions instead of guarded (meaninglessly: there's no valid
+/// fallback for an index that cannot occur) at every call site.
+#[allow(clippy::indexing_slicing)]
+#[inline]
+pub(crate) fn player_slot<T: Copy>(arr: [T; 2], p: Player) -> T {
+    match p {
+        Player::Black => arr[0],
+        Player::White => arr[1],
+    }
+}
+
+#[allow(clippy::indexing_slicing)]
+#[inline]
+pub(crate) fn player_slot_mut<T>(arr: &mut [T; 2], p: Player) -> &mut T {
+    match p {
+        Player::Black => &mut arr[0],
+        Player::White => &mut arr[1],
+    }
+}
+
 /// Fixed-seed xorshift64, used only to generate deterministic Zobrist keys
 /// at startup. Not a general-purpose RNG and not used for gameplay
 /// randomness (there is none — the AI is deterministic).
@@ -131,7 +155,9 @@ impl Board {
         let mut cells = [Cell::Wall; TOTAL];
         for y in 0..SIZE {
             for x in 0..SIZE {
-                cells[idx(x, y) as usize] = Cell::Empty;
+                if let Some(slot) = cells.get_mut(idx(x, y) as usize) {
+                    *slot = Cell::Empty;
+                }
             }
         }
 
@@ -314,7 +340,7 @@ impl Board {
                 }
                 let c = c_off as Idx;
                 let score = self.stone_window_score(c, d, owner, pt);
-                self.acc[owner as usize] += sign * score;
+                *player_slot_mut(&mut self.acc, owner) += sign * score;
             }
         }
     }
@@ -335,7 +361,7 @@ impl Board {
                     _ => continue,
                 };
                 let score = self.pair_vuln_score(c, d, owner);
-                self.acc[owner as usize] += sign * score;
+                *player_slot_mut(&mut self.acc, owner) += sign * score;
             }
         }
     }
@@ -376,7 +402,7 @@ impl Board {
             };
             let d = DIRS.get(di as usize).copied().unwrap_or(1);
             let score = self.stone_window_score(c, d, owner, pt);
-            self.acc[owner as usize] += sign * score;
+            *player_slot_mut(&mut self.acc, owner) += sign * score;
         }
     }
 
@@ -406,7 +432,7 @@ impl Board {
             };
             let d = DIRS.get(di as usize).copied().unwrap_or(1);
             let score = self.pair_vuln_score(c, d, owner);
-            self.acc[owner as usize] += sign * score;
+            *player_slot_mut(&mut self.acc, owner) += sign * score;
         }
     }
 
@@ -449,14 +475,19 @@ impl Board {
             self.adjust_axis_vuln(mv, -1);
 
             self.set_raw(mv, p.cell());
-            self.zobrist ^= self.key_cell[p as usize][mv as usize];
+            self.zobrist ^= self
+                .key_cell
+                .get(p as usize)
+                .and_then(|row| row.get(mv as usize))
+                .copied()
+                .unwrap_or(0);
             self.stone_count += 1;
             self.adjust_neighbor_grid(mv, 1);
 
             self.adjust_axis_neighbors(mv, pt, 1);
             self.adjust_axis_vuln(mv, 1);
             for &d in DIRS.iter() {
-                self.acc[p as usize] += self.stone_window_score(mv, d, p, pt);
+                *player_slot_mut(&mut self.acc, p) += self.stone_window_score(mv, d, p, pt);
             }
         } else {
             let mut changed: Vec<Idx> = Vec::with_capacity(1 + n);
@@ -467,13 +498,23 @@ impl Board {
             self.adjust_axis_vuln_dedup(&changed, -1);
 
             self.set_raw(mv, p.cell());
-            self.zobrist ^= self.key_cell[p as usize][mv as usize];
+            self.zobrist ^= self
+                .key_cell
+                .get(p as usize)
+                .and_then(|row| row.get(mv as usize))
+                .copied()
+                .unwrap_or(0);
             self.stone_count += 1;
             self.adjust_neighbor_grid(mv, 1);
 
             for cc in captured.iter().take(n) {
                 self.set_raw(*cc, Cell::Empty);
-                self.zobrist ^= self.key_cell[owner as usize][*cc as usize];
+                self.zobrist ^= self
+                    .key_cell
+                    .get(owner as usize)
+                    .and_then(|row| row.get(*cc as usize))
+                    .copied()
+                    .unwrap_or(0);
                 self.adjust_neighbor_grid(*cc, -1);
                 self.stone_count -= 1;
             }
@@ -482,11 +523,21 @@ impl Board {
             self.adjust_axis_vuln_dedup(&changed, 1);
         }
 
-        let old_idx = self.captures[p as usize].min(10) as usize;
-        self.zobrist ^= self.key_captures[p as usize].get(old_idx).copied().unwrap_or(0);
-        self.captures[p as usize] = self.captures[p as usize].saturating_add(n as u8);
-        let new_idx = self.captures[p as usize].min(10) as usize;
-        self.zobrist ^= self.key_captures[p as usize].get(new_idx).copied().unwrap_or(0);
+        let old_idx = player_slot(self.captures, p).min(10) as usize;
+        self.zobrist ^= self
+            .key_captures
+            .get(p as usize)
+            .and_then(|row| row.get(old_idx))
+            .copied()
+            .unwrap_or(0);
+        *player_slot_mut(&mut self.captures, p) = player_slot(self.captures, p).saturating_add(n as u8);
+        let new_idx = player_slot(self.captures, p).min(10) as usize;
+        self.zobrist ^= self
+            .key_captures
+            .get(p as usize)
+            .and_then(|row| row.get(new_idx))
+            .copied()
+            .unwrap_or(0);
 
         self.to_move = owner;
         self.zobrist ^= self.key_side;
@@ -535,8 +586,8 @@ impl Board {
                     _ => continue,
                 };
                 for &d in DIRS.iter() {
-                    acc[owner as usize] += self.stone_window_score(i, d, owner, pt);
-                    acc[owner as usize] += self.pair_vuln_score(i, d, owner);
+                    *player_slot_mut(&mut acc, owner) += self.stone_window_score(i, d, owner, pt);
+                    *player_slot_mut(&mut acc, owner) += self.pair_vuln_score(i, d, owner);
                 }
             }
         }
@@ -550,6 +601,7 @@ impl Default for Board {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,13 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::indexing_slicing)]
+// Every index into the [u8; W] window arrays in this file is bounded by
+// its enclosing loop range (0..W, or a +-4 offset from the center), never
+// by external input, and the classification logic is exhaustively checked
+// against an independent oracle on all 19,683 possible codes (see the
+// `table_matches_naive_oracle_on_all_codes` test below). The
+// indexing_slicing lint denied elsewhere in this crate (Cargo.toml)
+// guards against unproven runtime bounds on board-sized data — it doesn't
+// have anything to add here.
 
 pub const W: usize = 9;
 pub const C: usize = 4;
