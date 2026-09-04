@@ -1,0 +1,88 @@
+# Review package: 016f7bc..c871dec
+
+## Commits
+c871dec chore: project scaffolding, Makefile, empty binary
+
+## Files changed
+ .gitignore  |  2 ++
+ Cargo.toml  | 23 +++++++++++++++++++++++
+ Makefile    | 21 +++++++++++++++++++++
+ src/main.rs |  5 +++++
+ 4 files changed, 51 insertions(+)
+
+## Diff
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..982387b
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,2 @@
++/target
++/Gomoku
+diff --git a/Cargo.toml b/Cargo.toml
+new file mode 100644
+index 0000000..e9053e9
+--- /dev/null
++++ b/Cargo.toml
+@@ -0,0 +1,23 @@
++[package]
++name = "gomoku"
++version = "0.1.0"
++edition = "2021"
++
++[[bin]]
++name = "gomoku"
++path = "src/main.rs"
++
++[dependencies]
++macroquad = "=0.4.13"
++
++[profile.release]
++opt-level = 3
++lto = true
++codegen-units = 1
++panic = "unwind"
++
++[lints.clippy]
++unwrap_used = "deny"
++expect_used = "deny"
++panic = "deny"
++indexing_slicing = "deny"
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..09b62b8
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,21 @@
++NAME   := Gomoku
++TARGET := target/release/gomoku
++SRCS   := $(shell find src -name '*.rs') Cargo.toml Cargo.lock
++
++all: $(NAME)
++
++$(NAME): $(TARGET)
++	cp $(TARGET) $(NAME)
++
++$(TARGET): $(SRCS)
++	cargo build --release
++
++clean:
++	cargo clean
++
++fclean: clean
++	rm -f $(NAME)
++
++re: fclean all
++
++.PHONY: all clean fclean re
+diff --git a/src/main.rs b/src/main.rs
+new file mode 100644
+index 0000000..3e165e1
+--- /dev/null
++++ b/src/main.rs
+@@ -0,0 +1,5 @@
++#![forbid(unsafe_code)]
++
++fn main() {
++    println!("gomoku: scaffolding ok");
++}

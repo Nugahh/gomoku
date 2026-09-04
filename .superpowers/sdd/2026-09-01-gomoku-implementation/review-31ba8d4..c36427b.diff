@@ -1,0 +1,315 @@
+# Review package: 31ba8d4..c36427b
+
+## Commits
+c36427b fix: dedupe incremental accumulator on captures to stop double-counting overlapping windows
+
+## Files changed
+ src/board.rs | 211 +++++++++++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 169 insertions(+), 42 deletions(-)
+
+## Diff
+diff --git a/src/board.rs b/src/board.rs
+index ac6cc4e..74a7349 100644
+--- a/src/board.rs
++++ b/src/board.rs
+@@ -294,20 +294,90 @@ impl Board {
+                     Cell::Black => Player::Black,
+                     Cell::White => Player::White,
+                     _ => continue,
+                 };
+                 let score = self.pair_vuln_score(c, d, owner);
+                 self.acc[owner as usize] += sign * score;
+             }
+         }
+     }
+ 
++    /// Adds `sign * score` to the accumulator entry of every `(cell, axis)`
++    /// pattern-table window that could be affected by changes across ALL of
++    /// `changed` at once, touching each such window exactly once. Used only
++    /// on the capturing path, where `{mv} ∪ captured` can share overlapping
++    /// radius-4 influence zones (they are frequently collinear, since a
++    /// capture's flanking stone sits within a few cells of both `mv` and
++    /// the stones it captures) — calling `adjust_axis_neighbors` once per
++    /// center in that case double-counts any window in the overlap using
++    /// mismatched intermediate board snapshots. Call with `sign = -1`
++    /// before any mutation (every touched window reads the true pre-move
++    /// board), and `sign = 1` after all mutations are complete (every
++    /// touched window reads the true post-move board).
++    fn adjust_axis_dedup(&mut self, changed: &[Idx], pt: &PatternTable, sign: i32) {
++        let mut touched: Vec<(Idx, u8)> = Vec::new();
++        for &center in changed {
++            for (di, &d) in DIRS.iter().enumerate() {
++                for k in -4..=4i32 {
++                    let c_off = center as i32 + k * d as i32;
++                    if c_off < 0 || c_off as usize >= TOTAL {
++                        continue;
++                    }
++                    let key = (c_off as Idx, di as u8);
++                    if !touched.contains(&key) {
++                        touched.push(key);
++                    }
++                }
++            }
++        }
++        for &(c, di) in &touched {
++            let owner = match self.get(c) {
++                Cell::Black => Player::Black,
++                Cell::White => Player::White,
++                _ => continue,
++            };
++            let d = DIRS.get(di as usize).copied().unwrap_or(1);
++            let score = self.stone_window_score(c, d, owner, pt);
++            self.acc[owner as usize] += sign * score;
++        }
++    }
++
++    /// Same shape as `adjust_axis_dedup`, at `adjust_axis_vuln`'s smaller
++    /// (-2..=1) radius, for the capturing path.
++    fn adjust_axis_vuln_dedup(&mut self, changed: &[Idx], sign: i32) {
++        let mut touched: Vec<(Idx, u8)> = Vec::new();
++        for &center in changed {
++            for (di, &d) in DIRS.iter().enumerate() {
++                for k in -2..=1i32 {
++                    let c_off = center as i32 + k * d as i32;
++                    if c_off < 0 || c_off as usize >= TOTAL {
++                        continue;
++                    }
++                    let key = (c_off as Idx, di as u8);
++                    if !touched.contains(&key) {
++                        touched.push(key);
++                    }
++                }
++            }
++        }
++        for &(c, di) in &touched {
++            let owner = match self.get(c) {
++                Cell::Black => Player::Black,
++                Cell::White => Player::White,
++                _ => continue,
++            };
++            let d = DIRS.get(di as usize).copied().unwrap_or(1);
++            let score = self.pair_vuln_score(c, d, owner);
++            self.acc[owner as usize] += sign * score;
++        }
++    }
++
+     /// Updates the radius-2 neighbor-count grid used by `rules::generate`
+     /// (spec §7.4) around `center` by `delta`, saturating rather than
+     /// over/underflowing.
+     fn adjust_neighbor_grid(&mut self, center: Idx, delta: i32) {
+         let stride = STRIDE as i32;
+         for dy in -2..=2i32 {
+             for dx in -2..=2i32 {
+                 let i = center as i32 + dy * stride + dx;
+                 if i < 0 || i as usize >= TOTAL {
+                     continue;
+@@ -316,61 +386,68 @@ impl Board {
+                     *slot = (*slot as i32 + delta).clamp(0, 255) as u8;
+                 }
+             }
+         }
+     }
+ 
+     /// Applies `mv` for `self.to_move`. Assumes `mv` is legal — callers
+     /// must check `rules::is_legal` first (spec §6.4).
+     pub fn play(&mut self, mv: Idx, pt: &PatternTable) -> Undo {
+         let p = self.to_move;
+-        let mut undo = Undo {
++        let (captured, n) = self.captures_of(mv, p);
++        let owner = p.other();
++
++        let undo = Undo {
+             mv,
+-            captured: [0; 16],
+-            n_captured: 0,
++            captured,
++            n_captured: n as u8,
+             prev_zobrist: self.zobrist,
+             prev_acc: self.acc,
+             prev_captures: self.captures,
+         };
+ 
+-        self.adjust_axis_neighbors(mv, pt, -1);
+-        self.adjust_axis_vuln(mv, -1);
++        if n == 0 {
++            self.adjust_axis_neighbors(mv, pt, -1);
++            self.adjust_axis_vuln(mv, -1);
+ 
+-        self.set_raw(mv, p.cell());
+-        self.zobrist ^= self.key_cell[p as usize][mv as usize];
+-        self.stone_count += 1;
+-        self.adjust_neighbor_grid(mv, 1);
++            self.set_raw(mv, p.cell());
++            self.zobrist ^= self.key_cell[p as usize][mv as usize];
++            self.stone_count += 1;
++            self.adjust_neighbor_grid(mv, 1);
+ 
+-        let (captured, n) = self.captures_of(mv, p);
+-        let owner = p.other();
+-        for cc in captured.iter().take(n) {
+-            self.adjust_axis_neighbors(*cc, pt, -1);
+-            self.adjust_axis_vuln(*cc, -1);
++            self.adjust_axis_neighbors(mv, pt, 1);
++            self.adjust_axis_vuln(mv, 1);
+             for &d in DIRS.iter() {
+-                self.acc[owner as usize] -= self.stone_window_score(*cc, d, owner, pt);
++                self.acc[p as usize] += self.stone_window_score(mv, d, p, pt);
+             }
+-            self.set_raw(*cc, Cell::Empty);
+-            self.zobrist ^= self.key_cell[owner as usize][*cc as usize];
+-            self.adjust_neighbor_grid(*cc, -1);
+-            self.stone_count -= 1;
+-        }
+-        undo.captured = captured;
+-        undo.n_captured = n as u8;
+-
+-        self.adjust_axis_neighbors(mv, pt, 1);
+-        self.adjust_axis_vuln(mv, 1);
+-        for cc in captured.iter().take(n) {
+-            self.adjust_axis_neighbors(*cc, pt, 1);
+-            self.adjust_axis_vuln(*cc, 1);
+-        }
+-        for &d in DIRS.iter() {
+-            self.acc[p as usize] += self.stone_window_score(mv, d, p, pt);
++        } else {
++            let mut changed: Vec<Idx> = Vec::with_capacity(1 + n);
++            changed.push(mv);
++            changed.extend(captured.iter().take(n));
++
++            self.adjust_axis_dedup(&changed, pt, -1);
++            self.adjust_axis_vuln_dedup(&changed, -1);
++
++            self.set_raw(mv, p.cell());
++            self.zobrist ^= self.key_cell[p as usize][mv as usize];
++            self.stone_count += 1;
++            self.adjust_neighbor_grid(mv, 1);
++
++            for cc in captured.iter().take(n) {
++                self.set_raw(*cc, Cell::Empty);
++                self.zobrist ^= self.key_cell[owner as usize][*cc as usize];
++                self.adjust_neighbor_grid(*cc, -1);
++                self.stone_count -= 1;
++            }
++
++            self.adjust_axis_dedup(&changed, pt, 1);
++            self.adjust_axis_vuln_dedup(&changed, 1);
+         }
+ 
+         let old_idx = self.captures[p as usize].min(10) as usize;
+         self.zobrist ^= self.key_captures[p as usize].get(old_idx).copied().unwrap_or(0);
+         self.captures[p as usize] = self.captures[p as usize].saturating_add(n as u8);
+         let new_idx = self.captures[p as usize].min(10) as usize;
+         self.zobrist ^= self.key_captures[p as usize].get(new_idx).copied().unwrap_or(0);
+ 
+         self.to_move = owner;
+         self.zobrist ^= self.key_side;
+@@ -396,20 +473,45 @@ impl Board {
+         self.adjust_neighbor_grid(u.mv, -1);
+         self.stone_count -= 1;
+ 
+         self.zobrist = u.prev_zobrist;
+         self.acc = u.prev_acc;
+         self.captures = u.prev_captures;
+         self.to_move = mover;
+     }
+ }
+ 
++#[cfg(test)]
++impl Board {
++    /// Recomputes the accumulator from scratch by scanning every occupied
++    /// cell and axis, independent of the incremental machinery in `play`.
++    /// Used only to verify `play`/`undo` never let `acc` drift (spec §8.2).
++    pub(crate) fn full_recompute_acc(&self, pt: &PatternTable) -> [i32; 2] {
++        let mut acc = [0i32; 2];
++        for y in 0..SIZE {
++            for x in 0..SIZE {
++                let i = idx(x, y);
++                let owner = match self.get(i) {
++                    Cell::Black => Player::Black,
++                    Cell::White => Player::White,
++                    _ => continue,
++                };
++                for &d in DIRS.iter() {
++                    acc[owner as usize] += self.stone_window_score(i, d, owner, pt);
++                    acc[owner as usize] += self.pair_vuln_score(i, d, owner);
++                }
++            }
++        }
++        acc
++    }
++}
++
+ impl Default for Board {
+     fn default() -> Self {
+         Board::new()
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+@@ -587,27 +689,52 @@ mod tests {
+             assert_eq!(b.neighbor, snapshot.neighbor, "seed {seed}: neighbor grid differs");
+             assert_eq!(b.acc, snapshot.acc, "seed {seed}: accumulator differs");
+         }
+     }
+ 
+     #[test]
+     fn play_capture_updates_captures_and_frees_cells() {
+         let pt = PatternTable::build();
+         let mut b = Board::new();
+         // White _ Black Black _  ->  White plays at (3,0), captures the pair.
+-        b.set_raw(idx(0, 0), Cell::White);
+-        b.to_move = Player::Black;
++        // Built entirely through `play()` with natural turn alternation
++        // (Black moves first) rather than `set_raw`: `set_raw` bypasses acc
++        // bookkeeping entirely, which would taint the accumulator-vs-full-
++        // recompute assertion below with drift from *before* the capture,
++        // unrelated to what this test is actually verifying.
+         b.play(idx(1, 0), &pt); // Black
+-        b.to_move = Player::White;
+-        // set up manually instead of alternating turns, to isolate the capture:
+-        b.set_raw(idx(2, 0), Cell::Black);
+-        let before_black_stone_count = b.stone_count;
+-        b.to_move = Player::White;
+-        b.play(idx(3, 0), &pt);
++        b.play(idx(0, 0), &pt); // White
++        b.play(idx(2, 0), &pt); // Black
++        let before_capture_stone_count = b.stone_count;
++        b.play(idx(3, 0), &pt); // White, captures the pair
+         assert_eq!(b.get(idx(1, 0)), Cell::Empty, "captured stone not removed");
+         assert_eq!(b.get(idx(2, 0)), Cell::Empty, "captured stone not removed");
+         assert_eq!(b.captures[Player::White as usize], 2);
+-        // before_black_stone_count reflects the 1 Black stone placed via
+-        // `play` so far; White's move adds 1, the captured pair removes 2.
+-        assert_eq!(b.stone_count, before_black_stone_count + 1 - 2);
++        // White's capturing move adds 1 stone (itself), removes 2 (the pair).
++        assert_eq!(b.stone_count, before_capture_stone_count + 1 - 2);
++        assert_eq!(
++            b.acc,
++            b.full_recompute_acc(&pt),
++            "accumulator drifted from full recompute after a capturing play()"
++        );
++    }
++
++    #[test]
++    fn accumulator_matches_full_recompute_including_captures() {
++        let pt = PatternTable::build();
++        for seed in 0..300u64 {
++            let mut rng = Xorshift64(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
++            let mut b = Board::new();
++            for _ in 0..60 {
++                let Some(mv) = random_empty_cell(&b, &mut rng) else {
++                    break;
++                };
++                b.play(mv, &pt);
++                let full = b.full_recompute_acc(&pt);
++                assert_eq!(
++                    b.acc, full,
++                    "seed {seed}: accumulator drifted from full recompute after a play()"
++                );
++            }
++        }
+     }
+ }

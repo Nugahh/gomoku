@@ -73,7 +73,8 @@ mod tests {
             let mut b = Board::new();
             for _ in 0..40 {
                 let mut candidates = Vec::new();
-                rules::generate(&b, b.to_move, &pt, &mut candidates);
+                let to_move = b.to_move;
+                rules::generate(&mut b, to_move, &pt, &mut candidates);
                 if candidates.is_empty() {
                     break;
                 }

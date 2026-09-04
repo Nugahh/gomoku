@@ -1,0 +1,37 @@
+# Review package: 542fd1c..HEAD
+
+## Commits
+4ca8fa8 fix: saturate history-heuristic accumulator instead of unchecked add
+
+## Files changed
+ src/search.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/search.rs b/src/search.rs
+index 1842fe8..17dcb41 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -302,21 +302,21 @@ fn negamax(b: &mut Board, ctx: &mut SearchCtx, depth: u8, alpha: i32, beta: i32,
+             alpha = best;
+         }
+         if alpha >= beta {
+             if let Some(k) = ctx.killers.get_mut(ply as usize) {
+                 if k[0] != mv {
+                     k[1] = k[0];
+                     k[0] = mv;
+                 }
+             }
+             if let Some(slot) = ctx.history.get_mut(mv as usize) {
+-                *slot += (depth as i32) * (depth as i32);
++                *slot = slot.saturating_add((depth as i32) * (depth as i32));
+             }
+             break;
+         }
+     }
+ 
+     if let Some(bm) = best_move {
+         let bound = if best <= orig_alpha {
+             Bound::Upper
+         } else if best >= beta {
+             Bound::Lower

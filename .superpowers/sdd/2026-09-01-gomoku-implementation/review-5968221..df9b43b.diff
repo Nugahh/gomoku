@@ -1,0 +1,228 @@
+# Review package: 5968221..HEAD
+
+## Commits
+df9b43b feat: game end detection — endgame capture rule, win by capture, draw
+
+## Files changed
+ src/rules.rs | 159 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 157 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/src/rules.rs b/src/rules.rs
+index 52e8650..d95ac9e 100644
+--- a/src/rules.rs
++++ b/src/rules.rs
+@@ -1,14 +1,14 @@
+ #![forbid(unsafe_code)]
+ 
+-use crate::board::{idx, Board, Cell, Idx, Player, DIRS, SIZE};
+-use crate::patterns::{PatternTable, F_FREE_THREE};
++use crate::board::{idx, Board, Cell, Idx, Player, DIRS, SIZE, TOTAL};
++use crate::patterns::{PatternTable, F_FREE_THREE, F_FIVE};
+ 
+ /// Number of axes on which placing `p` at `mv` creates a free-three (spec
+ /// §7.2). Places the stone with a scratch `play`/`undo` (the accumulator
+ /// and Zobrist churn is wasted work here, but reusing the already-correct
+ /// `play`/`undo` is far less risky than a second bespoke place/remove path
+ /// — this is not on the search hot path, only on legality checks).
+ pub fn count_free_threes(b: &mut Board, mv: Idx, p: Player, pt: &PatternTable) -> u8 {
+     let saved_to_move = b.to_move;
+     b.to_move = p;
+     let u = b.play(mv, pt);
+@@ -33,20 +33,111 @@ pub fn is_legal(b: &Board, mv: Idx, p: Player, pt: &PatternTable) -> bool {
+         return false;
+     }
+     let (_captured, n) = b.captures_of(mv, p);
+     if n > 0 {
+         return true;
+     }
+     let mut scratch = b.clone();
+     count_free_threes(&mut scratch, mv, p, pt) < 2
+ }
+ 
++#[derive(Copy, Clone, PartialEq, Eq, Debug)]
++pub enum GameEnd {
++    None,
++    Win(Player),
++    Draw,
++}
++
++/// Walks outward from `last` in both signs of axis `d`, collecting every
++/// contiguous cell belonging to `p`'s alignment through `last` (spec §7.3
++/// step 2a).
++fn collect_alignment(b: &Board, last: Idx, d: i16, p: Player) -> Vec<Idx> {
++    let mut cells = vec![last];
++    let mut i = last as i32 - d as i32;
++    while i >= 0 && (i as usize) < TOTAL && b.get(i as Idx) == p.cell() {
++        cells.push(i as Idx);
++        i -= d as i32;
++    }
++    let mut i = last as i32 + d as i32;
++    while i >= 0 && (i as usize) < TOTAL && b.get(i as Idx) == p.cell() {
++        cells.push(i as Idx);
++        i += d as i32;
++    }
++    cells
++}
++
++/// True if `p`'s five along `alignment` does *not* win outright — either
++/// because `p` has already lost 4 pairs and the opponent has any capture
++/// available (spec §7.3 step 2b), or because some legal opponent move
++/// captures a stone that is part of `alignment` (step 2c).
++fn five_is_breakable(b: &Board, p: Player, alignment: &[Idx], pt: &PatternTable) -> bool {
++    let opp = p.other();
++    let mut candidates = Vec::new();
++    generate(b, opp, pt, &mut candidates);
++
++    let p_lost_stones = b.captures[opp as usize];
++    if p_lost_stones >= 8 {
++        for &mv2 in &candidates {
++            let (_c, n) = b.captures_of(mv2, opp);
++            if n > 0 {
++                return true;
++            }
++        }
++    }
++
++    for &mv2 in &candidates {
++        let (captured, n) = b.captures_of(mv2, opp);
++        if captured[..n].iter().any(|c| alignment.contains(c)) {
++            return true;
++        }
++    }
++    false
++}
++
++/// Evaluates the game state right after `p = b.to_move.other()` played
++/// `last`. Order of checks: win by capture (unconditional, spec R4) before
++/// win by alignment (conditional on breakability, spec R6/R7), before draw.
++/// Takes `&mut Board` to match this task's own signature contract with
++/// `search.rs`'s call sites, even though this implementation never
++/// mutates `b` — every helper it calls takes `&Board`.
++pub fn check_end(b: &mut Board, last: Idx, pt: &PatternTable) -> GameEnd {
++    let p = b.to_move.other();
++
++    if b.captures[p as usize] >= 10 {
++        return GameEnd::Win(p);
++    }
++
++    let mut any_five = false;
++    for &d in DIRS.iter() {
++        let code = b.window_code_pub(last, d, p);
++        if pt.get(code).flags & F_FIVE == 0 {
++            continue;
++        }
++        any_five = true;
++        let alignment = collect_alignment(b, last, d, p);
++        if !five_is_breakable(b, p, &alignment, pt) {
++            return GameEnd::Win(p);
++        }
++    }
++    if any_five {
++        return GameEnd::None;
++    }
++
++    let mut candidates = Vec::new();
++    generate(b, b.to_move, pt, &mut candidates);
++    if candidates.is_empty() {
++        return GameEnd::Draw;
++    }
++
++    GameEnd::None
++}
++
+ /// All legal candidate moves for `p`: empty cells with at least one stone
+ /// within Chebyshev radius 2, filtered by `is_legal`. On an empty board,
+ /// only the center cell qualifies (spec §7.4).
+ pub fn generate(b: &Board, p: Player, pt: &PatternTable, out: &mut Vec<Idx>) {
+     out.clear();
+     if b.stone_count == 0 {
+         let center = idx(SIZE / 2, SIZE / 2);
+         out.push(center);
+         return;
+     }
+@@ -180,20 +271,84 @@ mod tests {
+         generate(&b, Player::White, &pt, &mut out);
+         assert!(!out.is_empty());
+         for &mv in &out {
+             let (x, y) = crate::board::to_xy(mv);
+             let (cx, cy) = (9i32, 9i32);
+             let dist = (x as i32 - cx).abs().max((y as i32 - cy).abs());
+             assert!(dist <= 2, "candidate {mv:?} too far from the only stone");
+         }
+     }
+ 
++    #[test]
++    fn unbreakable_five_wins() {
++        let pt = PatternTable::build();
++        let mut b = Board::new();
++        for x in 4..8 {
++            let _ = play_raw(&mut b, idx(x, 5), Player::Black, &pt);
++        }
++        b.to_move = Player::Black;
++        b.play(idx(8, 5), &pt);
++        let result = check_end(&mut b, idx(8, 5), &pt);
++        assert_eq!(result, GameEnd::Win(Player::Black));
++    }
++
++    #[test]
++    fn five_broken_by_available_capture_is_not_a_win() {
++        // Black five along y=5, x=4..8. A vertical Black pair at (5,5)-(5,6)
++        // is flanked by an existing White stone at (5,4); White can play
++        // (5,7) to capture (5,5) and (5,6), removing (5,5) from the five.
++        let pt = PatternTable::build();
++        let mut b = Board::new();
++        for &(x, y, p) in &[
++            (4, 5, Player::Black),
++            (6, 5, Player::Black),
++            (7, 5, Player::Black),
++            (5, 6, Player::Black),
++            (5, 4, Player::White),
++            (5, 5, Player::Black),
++        ] {
++            let _ = play_raw(&mut b, idx(x, y), p, &pt);
++        }
++        b.to_move = Player::Black;
++        b.play(idx(8, 5), &pt);
++        let result = check_end(&mut b, idx(8, 5), &pt);
++        assert_eq!(result, GameEnd::None, "the (5,7) capture should break the five");
++    }
++
++    #[test]
++    fn five_not_a_win_when_mover_already_lost_four_pairs_and_capture_available() {
++        let pt = PatternTable::build();
++        let mut b = Board::new();
++        for x in 4..8 {
++            let _ = play_raw(&mut b, idx(x, 5), Player::Black, &pt);
++        }
++        b.captures[Player::White as usize] = 8; // Black has lost 4 pairs
++        let _ = play_raw(&mut b, idx(15, 15), Player::White, &pt);
++        let _ = play_raw(&mut b, idx(15, 16), Player::Black, &pt);
++        let _ = play_raw(&mut b, idx(15, 17), Player::Black, &pt);
++        b.to_move = Player::Black;
++        b.play(idx(8, 5), &pt);
++        let result = check_end(&mut b, idx(8, 5), &pt);
++        assert_eq!(result, GameEnd::None);
++    }
++
++    #[test]
++    fn ten_stones_captured_wins_by_capture() {
++        let pt = PatternTable::build();
++        let mut b = Board::new();
++        b.captures[Player::Black as usize] = 10;
++        let _ = play_raw(&mut b, idx(9, 9), Player::White, &pt);
++        b.to_move = Player::White; // so p = to_move.other() = Black
++        let result = check_end(&mut b, idx(9, 9), &pt);
++        assert_eq!(result, GameEnd::Win(Player::Black));
++    }
++
+     /// Test-only helper: plays a move for an arbitrary player regardless of
+     /// `b.to_move`, bypassing turn alternation, so fixtures can build
+     /// specific positions directly. Returns the `Undo` and restores
+     /// `to_move` to what it was, so `undo_raw` can reverse it symmetrically.
+     fn play_raw(b: &mut Board, mv: Idx, p: Player, pt: &PatternTable) -> (crate::board::Undo, Player) {
+         let saved_to_move = b.to_move;
+         b.to_move = p;
+         let u = b.play(mv, pt);
+         (u, saved_to_move)
+     }

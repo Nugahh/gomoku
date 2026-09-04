@@ -1,26 +1,21 @@
 #![forbid(unsafe_code)]
 
 use crate::board::{idx, player_slot, Board, Cell, Idx, Player, DIRS, SIZE, TOTAL};
-use crate::patterns::{PatternTable, F_FREE_THREE, F_FIVE};
+use crate::patterns::{Pat, PatternTable, F_FREE_THREE, F_FIVE};
 
 /// Number of axes on which placing `p` at `mv` creates a free-three (spec
-/// §7.2). Places the stone with a scratch `play`/`undo` (the accumulator
-/// and Zobrist churn is wasted work here, but reusing the already-correct
-/// `play`/`undo` is far less risky than a second bespoke place/remove path
-/// — this is not on the search hot path, only on legality checks).
-pub fn count_free_threes(b: &mut Board, mv: Idx, p: Player, pt: &PatternTable) -> u8 {
-    let saved_to_move = b.to_move;
-    b.to_move = p;
-    let u = b.play(mv, pt);
+/// §7.2). Only ever called from `is_legal` after captures are ruled out,
+/// so a real `play()` at `mv` would change no cell but `mv` itself —
+/// `hypothetical_window_code` reads exactly that same "pretend `mv` holds
+/// `p`" view directly from the real board, with no mutation at all.
+pub fn count_free_threes(b: &Board, mv: Idx, p: Player, pt: &PatternTable) -> u8 {
     let mut count = 0u8;
     for &d in DIRS.iter() {
-        let code = b.window_code_pub(mv, d, p);
+        let code = b.hypothetical_window_code(mv, d, p);
         if pt.get(code).flags & F_FREE_THREE != 0 {
             count += 1;
         }
     }
-    b.undo(&u);
-    b.to_move = saved_to_move;
     count
 }
 
@@ -36,8 +31,7 @@ pub fn is_legal(b: &Board, mv: Idx, p: Player, pt: &PatternTable) -> bool {
     if n > 0 {
         return true;
     }
-    let mut scratch = b.clone();
-    count_free_threes(&mut scratch, mv, p, pt) < 2
+    count_free_threes(b, mv, p, pt) < 2
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -122,12 +116,9 @@ pub fn check_end(b: &mut Board, last: Idx, pt: &PatternTable) -> GameEnd {
         return GameEnd::None;
     }
 
-    let mut candidates = Vec::new();
-    generate(b, b.to_move, pt, &mut candidates);
-    if candidates.is_empty() {
+    if !has_legal_move(b, b.to_move, pt) {
         return GameEnd::Draw;
     }
-
     GameEnd::None
 }
 
@@ -146,6 +137,77 @@ pub fn generate(b: &Board, p: Player, pt: &PatternTable, out: &mut Vec<Idx>) {
             let i = idx(x, y);
             if b.get(i) == Cell::Empty && b.has_neighbor(i) && is_legal(b, i, p, pt) {
                 out.push(i);
+            }
+        }
+    }
+}
+
+/// True if `p` has at least one legal move. Early-exits on the first legal
+/// cell found rather than enumerating every candidate like `generate` does
+/// — used by `check_end`'s draw check, which only ever needs a yes/no
+/// answer, not the full candidate list (spec §7.4).
+pub fn has_legal_move(b: &Board, p: Player, pt: &PatternTable) -> bool {
+    if b.stone_count == 0 {
+        return true;
+    }
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let i = idx(x, y);
+            if b.get(i) == Cell::Empty && b.has_neighbor(i) && is_legal(b, i, p, pt) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Like `generate`, but for the search hot path: returns each legal
+/// candidate alongside its four `p`-perspective axis `Pat`s and its capture
+/// count, computed once here instead of once in this legality filter and
+/// again in `search::order_score` (spec §7.4, §9.3 — the redundant
+/// recomputation this replaces, `order_score` no longer calls
+/// `hypothetical_window_code` or `captures_of` for `me`'s own side at all).
+/// Unlike `is_legal`, the axis `Pat`s are computed even for a capturing
+/// candidate: `order_score` still needs them to recognize a move that
+/// captures *and* completes a five/open-four, which must still outrank an
+/// ordinary capture — `is_legal` gets to skip that work because it only
+/// ever asks about `F_FREE_THREE`, but this function serves a caller that
+/// reads every flag, so it can't take that shortcut. The axis loop *can*
+/// still break early once a non-capturing candidate is already provably
+/// illegal (2 free-threes found, spec §7.1's double-three rule) — at that
+/// point it's discarded regardless of what the remaining axes hold, so
+/// nothing reads the rest of `pats` either way. That short-circuit must
+/// stay gated on `n == 0`: a capturing candidate is pushed unconditionally,
+/// so its `pats` — unlike a discarded illegal candidate's — really is read
+/// later, and needs to be complete.
+pub fn generate_with_patterns(b: &Board, p: Player, pt: &PatternTable, out: &mut Vec<(Idx, [Pat; 4], usize)>) {
+    out.clear();
+    if b.stone_count == 0 {
+        let center = idx(SIZE / 2, SIZE / 2);
+        out.push((center, [Pat::default(); 4], 0));
+        return;
+    }
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let i = idx(x, y);
+            if b.get(i) != Cell::Empty || !b.has_neighbor(i) {
+                continue;
+            }
+            let (_captured, n) = b.captures_of(i, p);
+            let mut pats = [Pat::default(); 4];
+            let mut free_three_count = 0u8;
+            for (slot, &d) in pats.iter_mut().zip(DIRS.iter()) {
+                let pat = pt.get(b.hypothetical_window_code(i, d, p));
+                *slot = pat;
+                if pat.flags & F_FREE_THREE != 0 {
+                    free_three_count += 1;
+                    if n == 0 && free_three_count >= 2 {
+                        break;
+                    }
+                }
+            }
+            if n > 0 || free_three_count < 2 {
+                out.push((i, pats, n));
             }
         }
     }
@@ -196,7 +258,7 @@ mod tests {
         // diagonal three-to-be sharing the same point a=(10,5):
         let u3 = play_raw(&mut b, idx(9, 4), Player::Black, &pt);
         let u4 = play_raw(&mut b, idx(11, 6), Player::Black, &pt);
-        assert!(!is_legal(&b, idx(10, 5), Player::Black, &pt));
+        assert!(!is_legal(&mut b, idx(10, 5), Player::Black, &pt));
         undo_raw(&mut b, u4);
         undo_raw(&mut b, u3);
         undo_raw(&mut b, u2);
@@ -214,7 +276,7 @@ mod tests {
         let u4 = play_raw(&mut b, idx(11, 6), Player::Black, &pt);
         // block one of the two free-three arms with a white stone
         let u5 = play_raw(&mut b, idx(7, 5), Player::White, &pt);
-        assert!(is_legal(&b, idx(10, 5), Player::Black, &pt));
+        assert!(is_legal(&mut b, idx(10, 5), Player::Black, &pt));
         undo_raw(&mut b, u5);
         undo_raw(&mut b, u4);
         undo_raw(&mut b, u3);
@@ -243,7 +305,7 @@ mod tests {
         let u5 = play_raw(&mut b, idx(10, 8), Player::Black, &pt);
         let u6 = play_raw(&mut b, idx(10, 6), Player::White, &pt);
         let u7 = play_raw(&mut b, idx(10, 7), Player::White, &pt);
-        assert!(is_legal(&b, idx(10, 5), Player::Black, &pt));
+        assert!(is_legal(&mut b, idx(10, 5), Player::Black, &pt));
         undo_raw(&mut b, u7);
         undo_raw(&mut b, u6);
         undo_raw(&mut b, u5);
@@ -256,9 +318,9 @@ mod tests {
     #[test]
     fn generate_on_empty_board_returns_only_center() {
         let pt = PatternTable::build();
-        let b = Board::new();
+        let mut b = Board::new();
         let mut out = Vec::new();
-        generate(&b, Player::Black, &pt, &mut out);
+        generate(&mut b, Player::Black, &pt, &mut out);
         assert_eq!(out, vec![idx(SIZE / 2, SIZE / 2)]);
     }
 
@@ -269,7 +331,7 @@ mod tests {
         b.to_move = Player::Black;
         let _u = play_raw(&mut b, idx(9, 9), Player::Black, &pt);
         let mut out = Vec::new();
-        generate(&b, Player::White, &pt, &mut out);
+        generate(&mut b, Player::White, &pt, &mut out);
         assert!(!out.is_empty());
         for &mv in &out {
             let (x, y) = crate::board::to_xy(mv);

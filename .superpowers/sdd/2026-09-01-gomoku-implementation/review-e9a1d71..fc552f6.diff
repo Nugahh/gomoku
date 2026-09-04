@@ -1,0 +1,37 @@
+# Review package: e9a1d71..HEAD
+
+## Commits
+fc552f6 fix: forced-block shortcut also keeps capturing moves, per spec §9.5
+
+## Files changed
+ src/search.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/search.rs b/src/search.rs
+index 3ccd157..4dfb232 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -238,21 +238,21 @@ fn score_order_and_truncate(
+     let mut scored: Vec<(i32, Idx)> = candidates
+         .iter()
+         .map(|&mv| {
+             let s = order_score(b, ctx.pt, mv, me, opp, tt_move, killers_here, &ctx.history);
+             (s, mv)
+         })
+         .collect();
+     scored.sort_unstable_by(|a, bb| bb.0.cmp(&a.0));
+ 
+     if scored.first().map(|&(s, _)| s >= ORD_BLOCK).unwrap_or(false) {
+-        scored.retain(|&(s, _)| s >= ORD_BLOCK);
++        scored.retain(|&(s, mv)| s >= ORD_BLOCK || b.captures_of(mv, me).1 > 0);
+     }
+     scored.truncate(ctx.cfg.max_candidates);
+     scored
+ }
+ 
+ /// Negamax with fail-soft alpha-beta (spec §9.2), late move reductions and
+ /// a capped threat extension (spec §9.5). `extensions_used` counts threat
+ /// extensions already applied along this line of the tree — capped at 4 so
+ /// a long forcing sequence can't blow the time budget. Returns a score
+ /// from the perspective of `b.to_move` at the node this call was invoked

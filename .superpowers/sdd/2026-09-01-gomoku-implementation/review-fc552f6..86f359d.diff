@@ -1,0 +1,511 @@
+# Review package: fc552f6..HEAD
+
+## Commits
+86f359d chore: satisfy clippy indexing_slicing/unwrap_used/expect_used/panic across the engine modules
+
+## Files changed
+ src/board.rs    | 84 ++++++++++++++++++++++++++++++++++++++++++++++-----------
+ src/eval.rs     |  9 ++++---
+ src/patterns.rs |  9 +++++++
+ src/rules.rs    |  9 ++++---
+ src/search.rs   |  1 +
+ 5 files changed, 88 insertions(+), 24 deletions(-)
+
+## Diff
+diff --git a/src/board.rs b/src/board.rs
+index 9adfdd8..511b682 100644
+--- a/src/board.rs
++++ b/src/board.rs
+@@ -65,20 +65,44 @@ impl Player {
+ 
+     #[inline]
+     pub fn cell(self) -> Cell {
+         match self {
+             Player::Black => Cell::Black,
+             Player::White => Cell::White,
+         }
+     }
+ }
+ 
++/// Indexes a `[T; 2]` array by `Player` without spreading a raw `[]`
++/// through the accumulator's hot path (Tasks 5/7/8). `p as usize` can only
++/// ever be 0 or 1 — the 2-variant enum makes it provably safe in a way
++/// `clippy::indexing_slicing` can't see — so the raw index is confined to
++/// these two functions instead of guarded (meaninglessly: there's no valid
++/// fallback for an index that cannot occur) at every call site.
++#[allow(clippy::indexing_slicing)]
++#[inline]
++pub(crate) fn player_slot<T: Copy>(arr: [T; 2], p: Player) -> T {
++    match p {
++        Player::Black => arr[0],
++        Player::White => arr[1],
++    }
++}
++
++#[allow(clippy::indexing_slicing)]
++#[inline]
++pub(crate) fn player_slot_mut<T>(arr: &mut [T; 2], p: Player) -> &mut T {
++    match p {
++        Player::Black => &mut arr[0],
++        Player::White => &mut arr[1],
++    }
++}
++
+ /// Fixed-seed xorshift64, used only to generate deterministic Zobrist keys
+ /// at startup. Not a general-purpose RNG and not used for gameplay
+ /// randomness (there is none — the AI is deterministic).
+ struct Xorshift64(u64);
+ 
+ impl Xorshift64 {
+     fn next(&mut self) -> u64 {
+         let mut x = self.0;
+         x ^= x << 13;
+         x ^= x >> 7;
+@@ -124,21 +148,23 @@ impl Board {
+         let mut key_captures = [[0u64; 11]; 2];
+         for player_keys in key_captures.iter_mut() {
+             for k in player_keys.iter_mut() {
+                 *k = rng.next();
+             }
+         }
+ 
+         let mut cells = [Cell::Wall; TOTAL];
+         for y in 0..SIZE {
+             for x in 0..SIZE {
+-                cells[idx(x, y) as usize] = Cell::Empty;
++                if let Some(slot) = cells.get_mut(idx(x, y) as usize) {
++                    *slot = Cell::Empty;
++                }
+             }
+         }
+ 
+         Board {
+             cells,
+             captures: [0, 0],
+             to_move: Player::Black,
+             zobrist: key_side, // Black moves first; folded in once, consistently
+             stone_count: 0,
+             neighbor: [0u8; TOTAL],
+@@ -307,42 +333,42 @@ impl Board {
+                     Cell::Black => Player::Black,
+                     Cell::White => Player::White,
+                     _ => continue,
+                 };
+                 let c_off = center as i32 + k * d as i32;
+                 if c_off < 0 || c_off as usize >= TOTAL {
+                     continue;
+                 }
+                 let c = c_off as Idx;
+                 let score = self.stone_window_score(c, d, owner, pt);
+-                self.acc[owner as usize] += sign * score;
++                *player_slot_mut(&mut self.acc, owner) += sign * score;
+             }
+         }
+     }
+ 
+     /// Same shape as `adjust_axis_neighbors`, at the smaller radius the
+     /// vulnerability term needs (see this task's implementation note).
+     fn adjust_axis_vuln(&mut self, center: Idx, sign: i32) {
+         for &d in DIRS.iter() {
+             for k in -2..=1i32 {
+                 let c_off = center as i32 + k * d as i32;
+                 if c_off < 0 || c_off as usize >= TOTAL {
+                     continue;
+                 }
+                 let c = c_off as Idx;
+                 let owner = match self.get(c) {
+                     Cell::Black => Player::Black,
+                     Cell::White => Player::White,
+                     _ => continue,
+                 };
+                 let score = self.pair_vuln_score(c, d, owner);
+-                self.acc[owner as usize] += sign * score;
++                *player_slot_mut(&mut self.acc, owner) += sign * score;
+             }
+         }
+     }
+ 
+     /// Adds `sign * score` to the accumulator entry of every `(cell, axis)`
+     /// pattern-table window that could be affected by changes across ALL of
+     /// `changed` at once, touching each such window exactly once. Used only
+     /// on the capturing path, where `{mv} ∪ captured` can share overlapping
+     /// radius-4 influence zones (they are frequently collinear, since a
+     /// capture's flanking stone sits within a few cells of both `mv` and
+@@ -369,21 +395,21 @@ impl Board {
+             }
+         }
+         for &(c, di) in &touched {
+             let owner = match self.get(c) {
+                 Cell::Black => Player::Black,
+                 Cell::White => Player::White,
+                 _ => continue,
+             };
+             let d = DIRS.get(di as usize).copied().unwrap_or(1);
+             let score = self.stone_window_score(c, d, owner, pt);
+-            self.acc[owner as usize] += sign * score;
++            *player_slot_mut(&mut self.acc, owner) += sign * score;
+         }
+     }
+ 
+     /// Same shape as `adjust_axis_dedup`, at `adjust_axis_vuln`'s smaller
+     /// (-2..=1) radius, for the capturing path.
+     fn adjust_axis_vuln_dedup(&mut self, changed: &[Idx], sign: i32) {
+         let mut touched: Vec<(Idx, u8)> = Vec::new();
+         for &center in changed {
+             for (di, &d) in DIRS.iter().enumerate() {
+                 for k in -2..=1i32 {
+@@ -399,21 +425,21 @@ impl Board {
+             }
+         }
+         for &(c, di) in &touched {
+             let owner = match self.get(c) {
+                 Cell::Black => Player::Black,
+                 Cell::White => Player::White,
+                 _ => continue,
+             };
+             let d = DIRS.get(di as usize).copied().unwrap_or(1);
+             let score = self.pair_vuln_score(c, d, owner);
+-            self.acc[owner as usize] += sign * score;
++            *player_slot_mut(&mut self.acc, owner) += sign * score;
+         }
+     }
+ 
+     /// Updates the radius-2 neighbor-count grid used by `rules::generate`
+     /// (spec §7.4) around `center` by `delta`, saturating rather than
+     /// over/underflowing.
+     fn adjust_neighbor_grid(&mut self, center: Idx, delta: i32) {
+         let stride = STRIDE as i32;
+         for dy in -2..=2i32 {
+             for dx in -2..=2i32 {
+@@ -442,58 +468,83 @@ impl Board {
+             prev_zobrist: self.zobrist,
+             prev_acc: self.acc,
+             prev_captures: self.captures,
+         };
+ 
+         if n == 0 {
+             self.adjust_axis_neighbors(mv, pt, -1);
+             self.adjust_axis_vuln(mv, -1);
+ 
+             self.set_raw(mv, p.cell());
+-            self.zobrist ^= self.key_cell[p as usize][mv as usize];
++            self.zobrist ^= self
++                .key_cell
++                .get(p as usize)
++                .and_then(|row| row.get(mv as usize))
++                .copied()
++                .unwrap_or(0);
+             self.stone_count += 1;
+             self.adjust_neighbor_grid(mv, 1);
+ 
+             self.adjust_axis_neighbors(mv, pt, 1);
+             self.adjust_axis_vuln(mv, 1);
+             for &d in DIRS.iter() {
+-                self.acc[p as usize] += self.stone_window_score(mv, d, p, pt);
++                *player_slot_mut(&mut self.acc, p) += self.stone_window_score(mv, d, p, pt);
+             }
+         } else {
+             let mut changed: Vec<Idx> = Vec::with_capacity(1 + n);
+             changed.push(mv);
+             changed.extend(captured.iter().take(n));
+ 
+             self.adjust_axis_dedup(&changed, pt, -1);
+             self.adjust_axis_vuln_dedup(&changed, -1);
+ 
+             self.set_raw(mv, p.cell());
+-            self.zobrist ^= self.key_cell[p as usize][mv as usize];
++            self.zobrist ^= self
++                .key_cell
++                .get(p as usize)
++                .and_then(|row| row.get(mv as usize))
++                .copied()
++                .unwrap_or(0);
+             self.stone_count += 1;
+             self.adjust_neighbor_grid(mv, 1);
+ 
+             for cc in captured.iter().take(n) {
+                 self.set_raw(*cc, Cell::Empty);
+-                self.zobrist ^= self.key_cell[owner as usize][*cc as usize];
++                self.zobrist ^= self
++                    .key_cell
++                    .get(owner as usize)
++                    .and_then(|row| row.get(*cc as usize))
++                    .copied()
++                    .unwrap_or(0);
+                 self.adjust_neighbor_grid(*cc, -1);
+                 self.stone_count -= 1;
+             }
+ 
+             self.adjust_axis_dedup(&changed, pt, 1);
+             self.adjust_axis_vuln_dedup(&changed, 1);
+         }
+ 
+-        let old_idx = self.captures[p as usize].min(10) as usize;
+-        self.zobrist ^= self.key_captures[p as usize].get(old_idx).copied().unwrap_or(0);
+-        self.captures[p as usize] = self.captures[p as usize].saturating_add(n as u8);
+-        let new_idx = self.captures[p as usize].min(10) as usize;
+-        self.zobrist ^= self.key_captures[p as usize].get(new_idx).copied().unwrap_or(0);
++        let old_idx = player_slot(self.captures, p).min(10) as usize;
++        self.zobrist ^= self
++            .key_captures
++            .get(p as usize)
++            .and_then(|row| row.get(old_idx))
++            .copied()
++            .unwrap_or(0);
++        *player_slot_mut(&mut self.captures, p) = player_slot(self.captures, p).saturating_add(n as u8);
++        let new_idx = player_slot(self.captures, p).min(10) as usize;
++        self.zobrist ^= self
++            .key_captures
++            .get(p as usize)
++            .and_then(|row| row.get(new_idx))
++            .copied()
++            .unwrap_or(0);
+ 
+         self.to_move = owner;
+         self.zobrist ^= self.key_side;
+ 
+         undo
+     }
+ 
+     /// Exactly reverses a `play`. Restores cells, neighbor grid and
+     /// stone_count by replaying the recorded change; restores zobrist, acc
+     /// and captures by direct snapshot rather than recomputing them (spec
+@@ -528,35 +579,36 @@ impl Board {
+         let mut acc = [0i32; 2];
+         for y in 0..SIZE {
+             for x in 0..SIZE {
+                 let i = idx(x, y);
+                 let owner = match self.get(i) {
+                     Cell::Black => Player::Black,
+                     Cell::White => Player::White,
+                     _ => continue,
+                 };
+                 for &d in DIRS.iter() {
+-                    acc[owner as usize] += self.stone_window_score(i, d, owner, pt);
+-                    acc[owner as usize] += self.pair_vuln_score(i, d, owner);
++                    *player_slot_mut(&mut acc, owner) += self.stone_window_score(i, d, owner, pt);
++                    *player_slot_mut(&mut acc, owner) += self.pair_vuln_score(i, d, owner);
+                 }
+             }
+         }
+         acc
+     }
+ }
+ 
+ impl Default for Board {
+     fn default() -> Self {
+         Board::new()
+     }
+ }
+ 
++#[allow(clippy::indexing_slicing)]
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]
+     fn idx_to_xy_roundtrip_covers_full_board() {
+         for y in 0..SIZE {
+             for x in 0..SIZE {
+                 let i = idx(x, y);
+                 assert_eq!(to_xy(i), (x, y), "roundtrip failed at ({x},{y})");
+diff --git a/src/eval.rs b/src/eval.rs
+index 7443e15..46e8b51 100644
+--- a/src/eval.rs
++++ b/src/eval.rs
+@@ -1,45 +1,46 @@
+ #![forbid(unsafe_code)]
+ 
+-use crate::board::{Board, Player};
++use crate::board::{player_slot, Board, Player};
+ 
+ pub const WIN: i32 = 100_000_000;
+ 
+ /// Non-linear on purpose: the 4th pair captured is worth far more than the
+ /// 1st, because it puts the opponent one capture from losing outright and
+ /// makes every one of their fives breakable (spec §8.3).
+ pub const CAP_BONUS: [i32; 6] = [0, 4_000, 12_000, 30_000, 90_000, 10_000_000];
+ 
+ /// Score of the current position from `b.to_move`'s point of view
+ /// (negamax convention). `acc` already includes the incremental
+ /// vulnerability penalty (spec §8.2/§8.3); the capture bonus is applied
+ /// fresh here via array lookup, since it is a cheap O(1) function of the
+ /// already-incrementally-maintained `captures` counters, not itself
+ /// incremental.
+ #[inline]
+ pub fn evaluate(b: &Board) -> i32 {
+     let me = b.to_move;
+     let op = me.other();
+-    let me_bonus = cap_bonus(b.captures[me as usize]);
+-    let op_bonus = cap_bonus(b.captures[op as usize]);
+-    (b.acc[me as usize] + me_bonus) - (b.acc[op as usize] + op_bonus)
++    let me_bonus = cap_bonus(player_slot(b.captures, me));
++    let op_bonus = cap_bonus(player_slot(b.captures, op));
++    (player_slot(b.acc, me) + me_bonus) - (player_slot(b.acc, op) + op_bonus)
+ }
+ 
+ #[inline]
+ fn cap_bonus(stones_captured: u8) -> i32 {
+     let pairs = (stones_captured / 2) as usize;
+     CAP_BONUS
+         .get(pairs)
+         .copied()
+         .unwrap_or_else(|| CAP_BONUS.iter().copied().last().unwrap_or(0))
+ }
+ 
++#[allow(clippy::indexing_slicing)]
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::board::idx;
+     use crate::patterns::PatternTable;
+     use crate::rules;
+ 
+     struct Xs(u64);
+     impl Xs {
+         fn next(&mut self) -> u64 {
+diff --git a/src/patterns.rs b/src/patterns.rs
+index ab8fedf..e69e4f5 100644
+--- a/src/patterns.rs
++++ b/src/patterns.rs
+@@ -1,11 +1,20 @@
+ #![forbid(unsafe_code)]
++#![allow(clippy::indexing_slicing)]
++// Every index into the [u8; W] window arrays in this file is bounded by
++// its enclosing loop range (0..W, or a +-4 offset from the center), never
++// by external input, and the classification logic is exhaustively checked
++// against an independent oracle on all 19,683 possible codes (see the
++// `table_matches_naive_oracle_on_all_codes` test below). The
++// indexing_slicing lint denied elsewhere in this crate (Cargo.toml)
++// guards against unproven runtime bounds on board-sized data — it doesn't
++// have anything to add here.
+ 
+ pub const W: usize = 9;
+ pub const C: usize = 4;
+ pub const TABLE_SIZE: usize = 19_683; // 3^9
+ pub const POW3: [u32; W] = [1, 3, 9, 27, 81, 243, 729, 2187, 6561];
+ 
+ pub const F_FIVE: u8 = 1 << 0;
+ pub const F_OPEN_FOUR: u8 = 1 << 1;
+ pub const F_FOUR: u8 = 1 << 2;
+ pub const F_FREE_THREE: u8 = 1 << 3;
+diff --git a/src/rules.rs b/src/rules.rs
+index d95ac9e..ecef1f3 100644
+--- a/src/rules.rs
++++ b/src/rules.rs
+@@ -1,13 +1,13 @@
+ #![forbid(unsafe_code)]
+ 
+-use crate::board::{idx, Board, Cell, Idx, Player, DIRS, SIZE, TOTAL};
++use crate::board::{idx, player_slot, Board, Cell, Idx, Player, DIRS, SIZE, TOTAL};
+ use crate::patterns::{PatternTable, F_FREE_THREE, F_FIVE};
+ 
+ /// Number of axes on which placing `p` at `mv` creates a free-three (spec
+ /// §7.2). Places the stone with a scratch `play`/`undo` (the accumulator
+ /// and Zobrist churn is wasted work here, but reusing the already-correct
+ /// `play`/`undo` is far less risky than a second bespoke place/remove path
+ /// — this is not on the search hot path, only on legality checks).
+ pub fn count_free_threes(b: &mut Board, mv: Idx, p: Player, pt: &PatternTable) -> u8 {
+     let saved_to_move = b.to_move;
+     b.to_move = p;
+@@ -67,49 +67,49 @@ fn collect_alignment(b: &Board, last: Idx, d: i16, p: Player) -> Vec<Idx> {
+ 
+ /// True if `p`'s five along `alignment` does *not* win outright — either
+ /// because `p` has already lost 4 pairs and the opponent has any capture
+ /// available (spec §7.3 step 2b), or because some legal opponent move
+ /// captures a stone that is part of `alignment` (step 2c).
+ fn five_is_breakable(b: &Board, p: Player, alignment: &[Idx], pt: &PatternTable) -> bool {
+     let opp = p.other();
+     let mut candidates = Vec::new();
+     generate(b, opp, pt, &mut candidates);
+ 
+-    let p_lost_stones = b.captures[opp as usize];
++    let p_lost_stones = player_slot(b.captures, opp);
+     if p_lost_stones >= 8 {
+         for &mv2 in &candidates {
+             let (_c, n) = b.captures_of(mv2, opp);
+             if n > 0 {
+                 return true;
+             }
+         }
+     }
+ 
+     for &mv2 in &candidates {
+         let (captured, n) = b.captures_of(mv2, opp);
+-        if captured[..n].iter().any(|c| alignment.contains(c)) {
++        if captured.iter().take(n).any(|c| alignment.contains(c)) {
+             return true;
+         }
+     }
+     false
+ }
+ 
+ /// Evaluates the game state right after `p = b.to_move.other()` played
+ /// `last`. Order of checks: win by capture (unconditional, spec R4) before
+ /// win by alignment (conditional on breakability, spec R6/R7), before draw.
+ /// Takes `&mut Board` to match this task's own signature contract with
+ /// `search.rs`'s call sites, even though this implementation never
+ /// mutates `b` — every helper it calls takes `&Board`.
+ pub fn check_end(b: &mut Board, last: Idx, pt: &PatternTable) -> GameEnd {
+     let p = b.to_move.other();
+ 
+-    if b.captures[p as usize] >= 10 {
++    if player_slot(b.captures, p) >= 10 {
+         return GameEnd::Win(p);
+     }
+ 
+     let mut any_five = false;
+     for &d in DIRS.iter() {
+         let code = b.window_code_pub(last, d, p);
+         if pt.get(code).flags & F_FIVE == 0 {
+             continue;
+         }
+         any_five = true;
+@@ -144,20 +144,21 @@ pub fn generate(b: &Board, p: Player, pt: &PatternTable, out: &mut Vec<Idx>) {
+     for y in 0..SIZE {
+         for x in 0..SIZE {
+             let i = idx(x, y);
+             if b.get(i) == Cell::Empty && b.has_neighbor(i) && is_legal(b, i, p, pt) {
+                 out.push(i);
+             }
+         }
+     }
+ }
+ 
++#[allow(clippy::indexing_slicing)]
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]
+     fn free_three_contiguous_diagonal_is_detected() {
+         let pt = PatternTable::build();
+         let mut b = Board::new();
+         b.to_move = Player::Black;
+         // three in a diagonal row with open ends: (5,5) (6,6) (7,7)
+diff --git a/src/search.rs b/src/search.rs
+index 4dfb232..38c1fd1 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -590,20 +590,21 @@ pub fn find_best_move(
+             nodes: ctx.nodes,
+             elapsed: start.elapsed(),
+             pv,
+             root_scores,
+             tt_hits: ctx.tt_hits,
+             tt_probes: ctx.tt_probes,
+         },
+     )
+ }
+ 
++#[allow(clippy::indexing_slicing, clippy::expect_used)]
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::board::{idx, SIZE};
+ 
+     fn far_deadline() -> Instant {
+         Instant::now() + Duration::from_secs(30)
+     }
+ 
+     #[test]
