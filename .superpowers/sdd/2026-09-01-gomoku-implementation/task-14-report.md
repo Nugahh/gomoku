@@ -1257,3 +1257,131 @@ escalation in this investigation.
 benchmark aggregation fix (`src/search.rs`) plus everything from Rulings
 9-14 (`src/rules.rs`, `src/search.rs`, `src/eval.rs`), `max_candidates`
 back at 14 in both places, all uncommitted.
+
+---
+
+## Update: Ruling 16 — corrected aggregation fix + full `max_candidates` sweep, one open concern before committing
+
+Replaced Ruling 15's `depth_reached > 0` check with the more complete
+version:
+
+```rust
+let found_forced_win = stats.root_scores.iter().any(|&(m, s)| m == mv && s >= WIN - 1000);
+if !found_forced_win {
+    min_depth = min_depth.min(stats.depth_reached);
+}
+```
+
+`WIN` reaches the test module via `use super::*;` picking up the
+module-level `use crate::eval::{self, WIN};` — no import change needed.
+Renamed the discarded `_mv` binding to `mv` since it's now read. Build,
+full suite, clippy all clean.
+
+**With this fix alone (max_candidates still 14): min_depth = 4**, not
+the 10 the coordinator expected. This was the key new data point: seeds
+2, 4, and 7 are now correctly excluded (all three do show
+`found_forced_win = true`), but the *other* seven positions were never
+"comfortably past depth 8-9" — their real depths have been `[4, 9, 6, 5,
+8, 5, 4]` (seeds 0,1,3,5,6,8,9) this whole time; only two of them (1 and
+6) reach 8-9, the rest cluster at 4-6. Excluding the forced-win positions
+doesn't change what the *other* positions' depths are — it just reveals
+that they were never as deep as assumed. This is a genuine throughput
+gap on real positions, exactly the trigger condition the coordinator
+named for re-engaging `max_candidates`.
+
+### Full `max_candidates` sweep (corrected aggregation, full suite re-verified at every value)
+
+| `max_candidates` | genuinely-searched depths (seeds 0,1,3,5,6,8/9,9) | min_depth | full suite incl. guardrails | benchmark |
+|---|---|---|---|---|
+| 14 | 4,9,6,5,8,5,4 | 4 | pass | fail |
+| 10 | 5,9,7,5,8,6,5 | 5 | pass | fail |
+| 8 | 5,9,6,5,8,6,5 | 5 | pass | fail |
+| 6 | 5,9,6,7,8,6,5 | 5 | pass | fail |
+| 4 | 7,10,8,8,9,7 (seed 8 became forced_win at this value) | 7 | pass | fail |
+| 3 | 8,12,9,10,12,9 | 8 | pass | fail |
+| **2** | **12,12,12,12,12,12 (every genuine position hit `max_depth`)** | **12** | **pass (38/38)** | **PASS** |
+
+Depths climbed steadily and the full suite — including
+`find_best_move_is_deterministic` and
+`find_best_move_extends_a_three_into_an_open_four` — stayed green at
+every single value down to 2, including the most extreme one tried.
+
+### The open concern: I don't think passing at `max_candidates=2` is strong evidence it's actually safe
+
+I re-checked `score_order_and_truncate` against this specific value
+before treating 2 as the answer:
+
+```rust
+scored.sort_unstable_by(|a, bb| bb.0.cmp(&a.0));
+if scored.first().map(|&(s, _)| s >= ORD_BLOCK).unwrap_or(false) {
+    scored.retain(|&(s, mv)| s >= ORD_BLOCK || b.captures_of(mv, me).1 > 0);
+}
+scored.truncate(ctx.cfg.max_candidates);
+```
+
+`retain` (keeping every forced-response-tier move) runs *before*
+`truncate`. So if a position has three or more legitimate ways to answer
+a four-threat, `retain` correctly keeps all of them — but `truncate(2)`
+then still cuts that down to 2, discarding a legitimate third blocking
+move. **The "forced-response moves always survive truncation" guarantee
+the coordinator described does not fully hold at `max_candidates=2`** —
+it only guarantees the *top-scoring* forced responses survive, not *all*
+of them, once there are more real ones than the cap allows.
+
+Separately: both guardrail tests that stayed green at every value are
+forcing/deterministic scenarios by construction —
+`find_best_move_extends_a_three_into_an_open_four` sets up a move that
+scores `ORD_OPEN_FOUR` or higher (a top-tier override, effectively
+guaranteed to survive any non-zero truncation), and
+`find_best_move_is_deterministic` checks reproducibility, not move
+*quality* — it would pass identically at `max_candidates=1`. Neither
+test exercises a *quiet*, non-forcing position with several genuinely
+competitive candidate moves, which is exactly the scenario
+`max_candidates=2` puts most at risk (spec §14's own rationale talks
+about a move "ranked 21st" being invisible as the accepted cost at
+`max_candidates=20` — going to 2 is a much larger jump than that
+framing seems to anticipate, and I don't have a test that would catch a
+real quiet-move quality regression at this extreme).
+
+I'm not saying 2 is wrong — the depth numbers are dramatic and the
+existing suite is genuinely green — but I don't have strong evidence
+it's *right* either, and this is exactly the kind of judgment call
+(correctness/quality tradeoff, not a mechanical fix) this investigation
+has escalated at every prior instance rather than deciding unilaterally.
+I did not commit pending a decision on this.
+
+### Current state (uncommitted)
+
+`max_candidates: 2` in both `SearchConfig::default()` and the benchmark's
+`cfg` (the technical answer to "smallest value that passes," per the
+sweep). `cargo build --release`: clean. `cargo clippy --release
+--all-targets`: clean. `cargo test`: 38/38. `cargo test --release`:
+38/38 (**benchmark gate passes**), confirmed stable across 3 consecutive
+runs (all well under the 400ms budget — seed 0-9 elapsed ranged
+0.1ms-280ms, no borderline timing anywhere). All of Rulings 9-16's
+changes are present in the working tree, uncommitted:
+- `src/rules.rs`: Ruling 10 (`hypothetical_window_code` in
+  `count_free_threes`), Ruling 12 (`has_legal_move`), Ruling 13
+  (`generate_with_patterns`), Ruling 14 (early-break in
+  `generate_with_patterns`'s free-three loop).
+- `src/search.rs`: the benchmark test itself, Ruling 13/14's
+  `order_score`/`score_order_and_truncate` restructuring, Ruling 16's
+  aggregation fix, `max_candidates: 2`.
+- `src/eval.rs`: one harmless leftover `&mut b` reborrow site from
+  Ruling 9's investigation (compiles and passes, never reverted since it
+  was flagged as not worth the time).
+
+### Status: DONE_WITH_CONCERNS — gate passes, but I want a decision on `max_candidates=2` before committing
+
+Everything requested is done and verified. The gate genuinely passes,
+stably, at `max_candidates=2`. I'm holding the commit specifically
+because of the retain-before-truncate gap and the guardrail-coverage gap
+above — both are real, code-verified observations, not hedging for its
+own sake. If the coordinator confirms 2 is acceptable (or names a
+different value/approach — e.g., accepting a value like 4 or 6 that
+doesn't pass the letter of R14 but preserves much more real breadth,
+paired with revisiting the benchmark's threshold or corpus instead), I
+will commit immediately on that direction. Report format followed
+(depth profile and min_depth at every value, full-suite confirmation at
+each, stability confirmation) even though I'm not committing yet, since
+that was requested regardless of outcome.

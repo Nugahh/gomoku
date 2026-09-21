@@ -869,3 +869,29 @@ special case bolted alongside it.
 **Cost if wrong:** Same low risk as Ruling 15's fix — a benchmark-test-only aggregation
 change, doesn't touch engine behavior, uses the exact same threshold constant the engine
 itself already treats as "conclusively decisive" rather than inventing a new one.
+
+**Result — the benchmark fix alone changed the picture materially.** Ruling 16's fix
+moved min_depth from 2 to 4 (not the "comfortably past 8-9" the controller expected) —
+the real, genuinely-searched positions turn out to have been `[4,9,6,5,8,5,4]` all
+along, not what the earlier (buggy) aggregation implied. Full max_candidates sweep,
+guardrail tests clean at every value:
+
+| max_candidates | 14 | 10 | 8 | 6 | 4 | 3 | 2 |
+|---|---|---|---|---|---|---|---|
+| min_depth | 4 | 5 | 5 | 5 | 7 | 8 | 12 (max_depth ceiling) |
+
+Gate technically passes at `max_candidates=2` (stable across 3 runs). **Not committed —
+flagged to the controller instead of accepted.** At cap=2, the implementer found a real,
+code-verified problem: `score_order_and_truncate`'s forced-response retain runs BEFORE
+`truncate(max_candidates)`, so the "forced moves always survive truncation" safety
+argument this whole investigation has leaned on breaks down at this extreme — a threat
+with 3+ legitimate responses would still lose one to the cap. Neither existing guardrail
+test exercises quiet-move/positional quality, only forcing/deterministic scenarios that
+survive by score-tier construction regardless of cap. The depth-12-hits-max_depth-ceiling
+result itself (at cap=2 only — cap=3 still fails at depth 8) is a strong structural
+signal: the search at cap=2 isn't meaningfully exploring anymore, it's racing down
+whatever the top-2 heuristic ordering happens to prefer at every node — satisfies the
+letter of R14 while likely gutting real playing strength, which is presumably the actual
+point of a depth-10 requirement in the first place. This is a genuine quality-vs-metric
+tension, not a tuning question — escalated to the human partner rather than decided
+unilaterally, since it materially changes what the shipped engine actually plays like.
